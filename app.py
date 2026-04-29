@@ -897,10 +897,36 @@ def strongest_correlations(df: pd.DataFrame, top_n: int = 10) -> pd.DataFrame:
 
 def select_time_frequency(span_days: int) -> Tuple[str, str]:
     if span_days > 365:
-        return "M", "mes"
+        return "ME", "mes"
     if span_days > 90:
-        return "W", "semana"
+        return "W-SUN", "semana"
     return "D", "dia"
+
+
+def safe_resample_series(series: pd.Series, freq: str, agg_mode: str) -> pd.Series:
+    candidates = [freq]
+    legacy_alias = {"ME": "M", "QE": "Q", "YE": "Y", "BME": "BM", "BQE": "BQ", "BYE": "BA", "W-SUN": "W"}
+    old = legacy_alias.get(freq)
+    if old:
+        candidates.append(old)
+
+    last_exc: Optional[Exception] = None
+    for cand in candidates:
+        try:
+            rs = series.resample(cand)
+            if agg_mode == "mean":
+                return rs.mean()
+            if agg_mode == "count":
+                return rs.count()
+            if agg_mode == "nunique":
+                return rs.nunique()
+            return rs.sum()
+        except Exception as exc:  # pragma: no cover - defensive for pandas alias changes
+            last_exc = exc
+
+    if last_exc:
+        raise last_exc
+    raise ValueError("Falha ao agregar serie temporal.")
 
 
 def select_numeric_metric_columns(df: pd.DataFrame, groups: dict[str, List[str]]) -> Tuple[List[str], List[str]]:
@@ -931,14 +957,8 @@ def period_comparison(df: pd.DataFrame, date_col: str, value_col: str, agg_mode:
         return None
     span_days = int((base[date_col].max() - base[date_col].min()).days)
     freq, label = select_time_frequency(span_days)
-    if agg_mode == "mean":
-        agg = base.set_index(date_col)[value_col].resample(freq).mean().dropna()
-    elif agg_mode == "count":
-        agg = base.set_index(date_col)[value_col].resample(freq).count().dropna()
-    elif agg_mode == "nunique":
-        agg = base.set_index(date_col)[value_col].resample(freq).nunique().dropna()
-    else:
-        agg = base.set_index(date_col)[value_col].resample(freq).sum().dropna()
+    series = base.set_index(date_col)[value_col]
+    agg = safe_resample_series(series, freq, agg_mode).dropna()
     if len(agg) < 2:
         return None
     current, previous = float(agg.iloc[-1]), float(agg.iloc[-2])
