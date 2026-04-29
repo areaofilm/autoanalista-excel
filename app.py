@@ -46,6 +46,7 @@ AUTH_LOCK_MINUTES = 10
 DEFAULT_OUTLIER_IQR_MULTIPLIER = 1.5
 DEFAULT_MAX_OUTLIER_DROP_PCT = 0.20
 DEFAULT_MIN_ROWS_AFTER_TREATMENT = 40
+CREATOR_SIGNATURE = "Walace.gorino"
 
 ROLE_PERMISSIONS = {
     "admin": {"ml": True, "export": True, "rules": True},
@@ -2401,6 +2402,7 @@ def build_pdf_report(
     story.append(Paragraph(f"Arquivo: {source_name}", styles["Normal"]))
     story.append(Paragraph(f"Aba/Tabela: {sheet_name}", styles["Normal"]))
     story.append(Paragraph(f"Versao: v{version}", styles["Normal"]))
+    story.append(Paragraph(f"Criador do app: {CREATOR_SIGNATURE}", styles["Normal"]))
     story.append(Paragraph(f"Gerado em: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}", styles["Normal"]))
     story.append(Spacer(1, 10))
 
@@ -2578,6 +2580,7 @@ def build_pdf_report(
 def main() -> None:
     ensure_data_storage()
     st.sidebar.title("AutoAnalista 2026")
+    st.sidebar.caption(f"Criador do app: {CREATOR_SIGNATURE}")
     theme = st.sidebar.selectbox("Tema visual", options=["Escuro", "Claro"], index=0)
     apply_theme(theme)
 
@@ -2585,6 +2588,7 @@ def main() -> None:
     if auth is None:
         st.title("AutoAnalista de Dados 2026")
         st.info("Faca login para iniciar as analises.")
+        st.caption(f"Assinatura do criador: {CREATOR_SIGNATURE}")
         st.stop()
 
     role = auth["role"]
@@ -2593,6 +2597,7 @@ def main() -> None:
 
     st.title("AutoAnalista de Dados 2026")
     st.caption("Analista profissional com qualidade, insights executivos, ML explicavel e governanca de historico.")
+    st.caption(f"Assinatura do criador: {CREATOR_SIGNATURE}")
 
     uploaded = st.file_uploader("Envie sua planilha", type=SUPPORTED_TYPES)
     if uploaded is None:
