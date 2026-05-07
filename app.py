@@ -1788,7 +1788,7 @@ def build_dashboard_export_bundle(
     }
 
 
-def render_auto_charts(df: pd.DataFrame, groups: dict[str, List[str]], top_corr: pd.DataFrame) -> None:
+def render_auto_charts(df: pd.DataFrame, groups: dict[str, List[str]], top_corr: pd.DataFrame, key_prefix: str = "auto_charts") -> None:
     st.markdown("**Graficos automaticos por perfil de dados**")
     metric_numeric, id_like_cols = select_numeric_metric_columns(df, groups)
     volume_col = pick_volume_id_column(df, id_like_cols)
@@ -1800,9 +1800,9 @@ def render_auto_charts(df: pd.DataFrame, groups: dict[str, List[str]], top_corr:
             c = st.columns(len(top_nums))
             for i, col in enumerate(top_nums):
                 fig = px.histogram(df, x=col, nbins=35, title=f"Distribuicao - {col}", marginal="box")
-                c[i].plotly_chart(fig, use_container_width=True)
+                c[i].plotly_chart(fig, use_container_width=True, key=f"{key_prefix}_hist_{i}_{col}")
             fig_box = px.box(df[top_nums], y=top_nums, title="Comparativo de dispersao")
-            st.plotly_chart(fig_box, use_container_width=True)
+            st.plotly_chart(fig_box, use_container_width=True, key=f"{key_prefix}_box_compare")
 
     if groups["categorical"]:
         chosen = []
@@ -1817,7 +1817,7 @@ def render_auto_charts(df: pd.DataFrame, groups: dict[str, List[str]], top_corr:
                 counts = df[col].fillna("NULO").astype(str).value_counts().head(12).reset_index()
                 counts.columns = [col, "quantidade"]
                 fig = px.bar(counts, x=col, y="quantidade", title=f"Top categorias - {col}", text="quantidade")
-                c[i].plotly_chart(fig, use_container_width=True)
+                c[i].plotly_chart(fig, use_container_width=True, key=f"{key_prefix}_cat_{i}_{col}")
 
     if groups["datetime"] and metric_numeric:
         date_col = max(groups["datetime"], key=lambda x: df[x].notna().sum())
@@ -1825,7 +1825,7 @@ def render_auto_charts(df: pd.DataFrame, groups: dict[str, List[str]], top_corr:
         comp = period_comparison(df, date_col, metric_col)
         if comp:
             fig = px.line(comp["series"], x=date_col, y=metric_col, markers=True, title=f"Serie temporal de {metric_col}")
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True, key=f"{key_prefix}_time_metric_{date_col}_{metric_col}")
     elif groups["datetime"] and volume_col:
         date_col = max(groups["datetime"], key=lambda x: df[x].notna().sum())
         comp = period_comparison(df, date_col, volume_col, agg_mode="nunique")
@@ -1834,7 +1834,7 @@ def render_auto_charts(df: pd.DataFrame, groups: dict[str, List[str]], top_corr:
             value_name = "quantidade_registros"
             series.columns = [date_col, value_name]
             fig = px.line(series, x=date_col, y=value_name, markers=True, title=f"Serie temporal de quantidade ({volume_col})")
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True, key=f"{key_prefix}_time_volume_{date_col}_{volume_col}")
 
     if not top_corr.empty:
         c1 = top_corr.iloc[0]["variavel_1"]
@@ -1842,7 +1842,7 @@ def render_auto_charts(df: pd.DataFrame, groups: dict[str, List[str]], top_corr:
         base = df[[c1, c2]].dropna().head(5000)
         if len(base) >= 10:
             fig = px.scatter(base, x=c1, y=c2, title=f"Relacao entre {c1} e {c2}", opacity=0.7)
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True, key=f"{key_prefix}_scatter_corr_{c1}_{c2}")
 
 
 def render_management_dashboard(
@@ -1952,10 +1952,12 @@ def render_management_dashboard(
         left.plotly_chart(
             px.pie(dist, names=cat_col, values="quantidade", title=f"Participacao por {cat_col}"),
             use_container_width=True,
+            key=f"{key_prefix}_pie_{cat_col}",
         )
         right.plotly_chart(
             px.bar(dist, x=cat_col, y="quantidade", text="quantidade", title=f"Top {top_n} categorias - {cat_col}"),
             use_container_width=True,
+            key=f"{key_prefix}_bar_top_{cat_col}",
         )
 
         if metric_numeric:
@@ -1967,21 +1969,27 @@ def render_management_dashboard(
             )
             agg_mode = mix2.selectbox(
                 "Agregacao da metrica",
-                options=["Soma", "Media", "Mediana"],
+                options=["Soma", "Media", "Mediana", "Contagem"],
                 key=f"{key_prefix}_agg_metric_by_cat",
             )
-            grp = dashboard_df[[cat_col, metric_col]].dropna(subset=[cat_col, metric_col]).copy()
+            grp = dashboard_df[[cat_col, metric_col]].dropna(subset=[cat_col]).copy()
             grp[cat_col] = grp[cat_col].astype(str)
+            value_col = metric_col
             if agg_mode == "Media":
                 out = grp.groupby(cat_col, as_index=False)[metric_col].mean()
             elif agg_mode == "Mediana":
                 out = grp.groupby(cat_col, as_index=False)[metric_col].median()
+            elif agg_mode == "Contagem":
+                out = grp.groupby(cat_col, as_index=False).size().rename(columns={"size": "contagem"})
+                value_col = "contagem"
             else:
                 out = grp.groupby(cat_col, as_index=False)[metric_col].sum()
-            out = out.sort_values(metric_col, ascending=False).head(top_n)
+            out = out.sort_values(value_col, ascending=False).head(top_n)
+            title = f"Contagem de registros por {cat_col}" if agg_mode == "Contagem" else f"{agg_mode} de {metric_col} por {cat_col}"
             st.plotly_chart(
-                px.bar(out, x=cat_col, y=metric_col, text=metric_col, title=f"{agg_mode} de {metric_col} por {cat_col}"),
+                px.bar(out, x=cat_col, y=value_col, text=value_col, title=title),
                 use_container_width=True,
+                key=f"{key_prefix}_metric_by_cat_{cat_col}_{value_col}_{agg_mode}",
             )
         elif volume_col:
             grp = (
@@ -1996,6 +2004,7 @@ def render_management_dashboard(
             st.plotly_chart(
                 px.bar(grp, x=cat_col, y=volume_col, text=volume_col, title=f"Quantidade de IDs unicos por {cat_col}"),
                 use_container_width=True,
+                key=f"{key_prefix}_ids_by_cat_{cat_col}_{volume_col}",
             )
 
     if date_col:
@@ -2005,7 +2014,7 @@ def render_management_dashboard(
         trend_choices.extend([f"Metrica numerica ({c})" for c in metric_numeric])
         t1, t2 = st.columns(2)
         trend_choice = t1.selectbox("Indicador da serie temporal", options=trend_choices, key=f"{key_prefix}_trend_choice")
-        metric_agg = t2.selectbox("Agregacao numerica temporal", options=["Soma", "Media", "Mediana"], key=f"{key_prefix}_trend_agg")
+        metric_agg = t2.selectbox("Agregacao numerica temporal", options=["Soma", "Media", "Mediana", "Contagem"], key=f"{key_prefix}_trend_agg")
 
         dt_series = pd.to_datetime(dashboard_df[date_col], errors="coerce", dayfirst=True)
         time_df = dashboard_df.copy()
@@ -2028,6 +2037,8 @@ def render_management_dashboard(
                     trend = base[metric_col].resample(freq).mean().reset_index(name="valor")
                 elif metric_agg == "Mediana":
                     trend = base[metric_col].resample(freq).median().reset_index(name="valor")
+                elif metric_agg == "Contagem":
+                    trend = base[metric_col].resample(freq).count().reset_index(name="valor")
                 else:
                     trend = base[metric_col].resample(freq).sum().reset_index(name="valor")
                 y_name = "valor"
@@ -2036,10 +2047,12 @@ def render_management_dashboard(
             chart_left.plotly_chart(
                 px.line(trend, x=date_col, y=y_name, markers=True, title=f"Tendencia por {freq_label}"),
                 use_container_width=True,
+                key=f"{key_prefix}_trend_line_{date_col}_{trend_choice}_{metric_agg}",
             )
             chart_right.plotly_chart(
                 px.bar(trend, x=date_col, y=y_name, title=f"Volume por {freq_label}"),
                 use_container_width=True,
+                key=f"{key_prefix}_trend_bar_{date_col}_{trend_choice}_{metric_agg}",
             )
 
     if dist_col:
@@ -2047,6 +2060,7 @@ def render_management_dashboard(
         dist_left.plotly_chart(
             px.histogram(dashboard_df, x=dist_col, nbins=35, title=f"Distribuicao de {dist_col}", marginal="box"),
             use_container_width=True,
+            key=f"{key_prefix}_dist_hist_{dist_col}",
         )
         if cat_col:
             bx = dashboard_df[[cat_col, dist_col]].dropna(subset=[cat_col, dist_col]).copy()
@@ -2056,6 +2070,7 @@ def render_management_dashboard(
             dist_right.plotly_chart(
                 px.box(bx, x=cat_col, y=dist_col, title=f"Dispersao de {dist_col} por {cat_col}"),
                 use_container_width=True,
+                key=f"{key_prefix}_dist_box_{cat_col}_{dist_col}",
             )
 
     if len(metric_numeric) >= 2:
@@ -2072,12 +2087,17 @@ def render_management_dashboard(
             st.plotly_chart(
                 px.scatter(base, x=x_col, y=y_col, opacity=0.7, title=f"Relacao entre {x_col} e {y_col}"),
                 use_container_width=True,
+                key=f"{key_prefix}_scatter_{x_col}_{y_col}",
             )
 
     if len(metric_numeric) >= 2:
         top_numeric = metric_numeric[: min(12, len(metric_numeric))]
         corr = dashboard_df[top_numeric].corr(numeric_only=True)
-        st.plotly_chart(px.imshow(corr, text_auto=True, title="Heatmap de correlacao (top numericas)"), use_container_width=True)
+        st.plotly_chart(
+            px.imshow(corr, text_auto=True, title="Heatmap de correlacao (top numericas)"),
+            use_container_width=True,
+            key=f"{key_prefix}_heatmap_corr",
+        )
 
     if len(issue_catalog) > 0:
         st.markdown("**Top riscos para a gerencia**")
@@ -2862,7 +2882,7 @@ def main() -> None:
                     cols[i].caption(item["alert"])
         else:
             st.info("Sem KPIs suficientes para deteccao automatica.")
-        render_auto_charts(analysis_df, groups, top_corr)
+        render_auto_charts(analysis_df, groups, top_corr, key_prefix=f"insights_{analysis_key}")
         if len(top_corr) > 0:
             st.markdown("**Correlacoes de destaque**")
             st.dataframe(top_corr, use_container_width=True)
