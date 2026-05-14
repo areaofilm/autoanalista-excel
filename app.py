@@ -67,6 +67,14 @@ def hash_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def sync_session_value(source_key: str, state_key: str, mirror_key: Optional[str] = None) -> None:
+    """Keep equivalent controls in sidebar and tab synchronized."""
+    value = st.session_state.get(source_key)
+    st.session_state[state_key] = value
+    if mirror_key:
+        st.session_state[mirror_key] = value
+
+
 DEMO_AUTH_USERS = {
     "admin": {"password_hash": hash_text("admin2026!"), "role": "admin"},
     "analista": {"password_hash": hash_text("analista2026!"), "role": "analyst"},
@@ -2896,27 +2904,54 @@ def main() -> None:
         f"outliers={treatment_report['outliers_removed']}."
     )
 
-    predictive_target_col = "(nao usar)"
-    predictive_model_choice = "Random Forest"
+    target_options = ["(nao usar)"] + analysis_df.columns.tolist()
+    model_options = ["Random Forest", "Regressao Linear / Logistica"]
+    target_state_key = f"predictive_target_value_{analysis_key}"
+    target_sidebar_key = f"predictive_target_sidebar_{analysis_key}"
+    target_tab_key = f"predictive_target_tab_{analysis_key}"
+    model_state_key = f"predictive_model_value_{analysis_key}"
+    model_sidebar_key = f"predictive_model_sidebar_{analysis_key}"
+    model_tab_key = f"predictive_model_tab_{analysis_key}"
+
+    if st.session_state.get(target_state_key) not in target_options:
+        st.session_state[target_state_key] = "(nao usar)"
+    if st.session_state.get(model_state_key) not in model_options:
+        st.session_state[model_state_key] = "Random Forest"
+    for widget_key in [target_sidebar_key, target_tab_key]:
+        if st.session_state.get(widget_key) not in target_options:
+            st.session_state[widget_key] = st.session_state[target_state_key]
+    for widget_key in [model_sidebar_key, model_tab_key]:
+        if st.session_state.get(widget_key) not in model_options:
+            st.session_state[widget_key] = st.session_state[model_state_key]
+
+    predictive_target_col = st.session_state[target_state_key]
+    predictive_model_choice = st.session_state[model_state_key]
     train_predictive_model = False
     if perms["ml"]:
         st.sidebar.markdown("---")
         st.sidebar.subheader("Modelagem Preditiva")
         st.sidebar.caption("Usa os dados ja tratados, filtrados e saneados pela analise atual.")
-        predictive_target_col = st.sidebar.selectbox(
+        st.sidebar.selectbox(
             "Variavel alvo para prever",
-            options=["(nao usar)"] + analysis_df.columns.tolist(),
-            key=f"predictive_target_{analysis_key}",
+            options=target_options,
+            key=target_sidebar_key,
+            on_change=sync_session_value,
+            args=(target_sidebar_key, target_state_key, target_tab_key),
         )
-        predictive_model_choice = st.sidebar.selectbox(
+        st.sidebar.selectbox(
             "Tipo de modelo",
-            options=["Random Forest", "Regressao Linear / Logistica"],
-            key=f"predictive_model_{analysis_key}",
+            options=model_options,
+            key=model_sidebar_key,
+            on_change=sync_session_value,
+            args=(model_sidebar_key, model_state_key, model_tab_key),
         )
+        predictive_target_col = st.session_state[target_state_key]
+        predictive_model_choice = st.session_state[model_state_key]
         train_predictive_model = st.sidebar.button(
             "Treinar Modelo",
             use_container_width=True,
             key=f"predictive_train_{analysis_key}",
+            disabled=(predictive_target_col == "(nao usar)"),
         )
 
     tabs = st.tabs(["Resumo", "Dashboard", "Qualidade", "Insights", "ML", "Relatorio"])
@@ -2998,11 +3033,30 @@ def main() -> None:
             st.caption("Execucao sob demanda: rode ML apenas quando necessario.")
             st.markdown("**Modelagem Preditiva**")
             st.info(
-                "Configure a variavel alvo e o tipo de modelo na secao `Modelagem Preditiva` do sidebar. "
-                "O treinamento usa o dataframe principal ja tratado."
+                "Escolha abaixo a variavel alvo que deseja prever. O treinamento usa o dataframe principal ja tratado, "
+                "com limpeza, duplicidades e outliers conforme a configuracao atual."
             )
-            st.write(f"Alvo selecionado: `{predictive_target_col}`")
-            st.write(f"Modelo selecionado: `{predictive_model_choice}`")
+            ml_cfg1, ml_cfg2 = st.columns(2)
+            ml_cfg1.selectbox(
+                "Variavel alvo para prever",
+                options=target_options,
+                key=target_tab_key,
+                on_change=sync_session_value,
+                args=(target_tab_key, target_state_key, target_sidebar_key),
+            )
+            ml_cfg2.selectbox(
+                "Tipo de modelo",
+                options=model_options,
+                key=model_tab_key,
+                on_change=sync_session_value,
+                args=(model_tab_key, model_state_key, model_sidebar_key),
+            )
+            predictive_target_col = st.session_state[target_state_key]
+            predictive_model_choice = st.session_state[model_state_key]
+            if predictive_target_col == "(nao usar)":
+                st.warning("Selecione uma variavel alvo para liberar o treinamento supervisionado.")
+            else:
+                st.success(f"Pronto para treinar `{predictive_model_choice}` prevendo `{predictive_target_col}`.")
             contamination = st.slider(
                 "Taxa de anomalias (ML sem alvo)",
                 min_value=0.01,
@@ -3014,7 +3068,12 @@ def main() -> None:
 
             c1, c2 = st.columns(2)
             run_unsup = c1.button("Executar ML Sem Alvo", use_container_width=True, key=f"run_unsup_{analysis_key}")
-            run_sup_tab = c2.button("Treinar Modelo Agora", use_container_width=True, key=f"run_sup_{analysis_key}")
+            run_sup_tab = c2.button(
+                "Treinar Modelo Agora",
+                use_container_width=True,
+                key=f"run_sup_{analysis_key}",
+                disabled=(predictive_target_col == "(nao usar)"),
+            )
             run_sup = train_predictive_model or run_sup_tab
 
             unsup_cache_key = f"{analysis_key}::unsup::{contamination:.2f}"
