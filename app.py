@@ -23,6 +23,7 @@ from sklearn.decomposition import PCA
 from sklearn.ensemble import IsolationForest, RandomForestClassifier, RandomForestRegressor
 from sklearn.impute import SimpleImputer
 from sklearn.inspection import permutation_importance
+from sklearn.linear_model import LinearRegression, LogisticRegression
 from sklearn.metrics import (
     accuracy_score,
     f1_score,
@@ -609,7 +610,8 @@ def render_custom_rules_editor(columns: List[str], can_edit: bool, username: str
     if "custom_rules_context" not in st.session_state:
         st.session_state.custom_rules_context = None
 
-    context_key = f"{username}::{area}::{len(columns)}"
+    columns_signature = hash_text("|".join(map(str, columns)))[:12]
+    context_key = f"{username}::{area}::{columns_signature}"
     store = load_rules_store()
     user_area_key = auth_key_for_rules(username, area)
 
@@ -640,19 +642,24 @@ def render_custom_rules_editor(columns: List[str], can_edit: bool, username: str
             st.sidebar.success("Regras salvas carregadas.")
 
         with st.sidebar.form("rule_form", clear_on_submit=True):
-            col = st.selectbox("Coluna", options=columns)
+            col = st.selectbox("Coluna", options=columns, key=f"rule_form_column_{columns_signature}")
             rule = st.selectbox(
                 "Regra",
                 options=["required", "email", "cpf", "non_negative", "no_future_date", "min_value", "max_value"],
+                key=f"rule_form_rule_{columns_signature}",
             )
             min_value = None
             max_value = None
             if rule == "min_value":
-                min_value = st.number_input("Valor minimo", value=0.0)
+                min_value = st.number_input("Valor minimo", value=0.0, key=f"rule_form_min_value_{columns_signature}")
             if rule == "max_value":
-                max_value = st.number_input("Valor maximo", value=0.0)
-            priority = st.selectbox("Prioridade", options=["critical", "high", "medium", "low"], index=2)
-            suggestion = st.text_input("Acao sugerida", value="Revisar e corrigir os registros fora do padrao.")
+                max_value = st.number_input("Valor maximo", value=0.0, key=f"rule_form_max_value_{columns_signature}")
+            priority = st.selectbox("Prioridade", options=["critical", "high", "medium", "low"], index=2, key=f"rule_form_priority_{columns_signature}")
+            suggestion = st.text_input(
+                "Acao sugerida",
+                value="Revisar e corrigir os registros fora do padrao.",
+                key=f"rule_form_suggestion_{columns_signature}",
+            )
             submitted = st.form_submit_button("Adicionar regra")
             if submitted:
                 params = {}
@@ -1239,7 +1246,7 @@ def quality_status(score: float) -> str:
     return "Vermelho"
 
 
-def render_quality_overview(quality_report: dict, groups: dict[str, List[str]]) -> None:
+def render_quality_overview(quality_report: dict, groups: dict[str, List[str]], key_prefix: str = "quality") -> None:
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Score Qualidade", f"{quality_report['score']:.1f}/100")
     c2.metric("Semaforo", quality_status(quality_report["score"]))
@@ -1278,9 +1285,9 @@ def render_quality_overview(quality_report: dict, groups: dict[str, List[str]]) 
 
     left, right = st.columns(2)
     with left:
-        st.plotly_chart(gauge, use_container_width=True)
+        st.plotly_chart(gauge, use_container_width=True, key=f"{key_prefix}_gauge")
     with right:
-        st.plotly_chart(fig_pillars, use_container_width=True)
+        st.plotly_chart(fig_pillars, use_container_width=True, key=f"{key_prefix}_pillars")
 
     type_df = pd.DataFrame(
         {
@@ -1289,13 +1296,19 @@ def render_quality_overview(quality_report: dict, groups: dict[str, List[str]]) 
         }
     )
     fig_types = px.pie(type_df, names="Tipo", values="Quantidade", title="Composicao de Tipos")
-    st.plotly_chart(fig_types, use_container_width=True)
+    st.plotly_chart(fig_types, use_container_width=True, key=f"{key_prefix}_types")
 
 
 def render_global_filters(df: pd.DataFrame, groups: dict[str, List[str]]) -> Tuple[pd.DataFrame, List[str]]:
     st.sidebar.markdown("---")
     st.sidebar.subheader("Filtros Globais")
-    cols = st.sidebar.multiselect("Selecionar colunas para filtrar", options=df.columns.tolist(), default=[])
+    filter_context = hash_text("|".join(map(str, df.columns)))[:12]
+    cols = st.sidebar.multiselect(
+        "Selecionar colunas para filtrar",
+        options=df.columns.tolist(),
+        default=[],
+        key=f"global_filter_columns_{filter_context}",
+    )
     filtered = df.copy()
     active = []
 
@@ -1308,7 +1321,13 @@ def render_global_filters(df: pd.DataFrame, groups: dict[str, List[str]]) -> Tup
             max_v = float(non_null.max())
             if min_v == max_v:
                 continue
-            chosen = st.sidebar.slider(f"{col} (intervalo)", min_value=min_v, max_value=max_v, value=(min_v, max_v), key=f"flt_num_{col}")
+            chosen = st.sidebar.slider(
+                f"{col} (intervalo)",
+                min_value=min_v,
+                max_value=max_v,
+                value=(min_v, max_v),
+                key=f"flt_num_{filter_context}_{col}",
+            )
             filtered = filtered[(filtered[col].isna()) | ((filtered[col] >= chosen[0]) & (filtered[col] <= chosen[1]))]
             active.append(f"{col}: {chosen[0]:.2f} ate {chosen[1]:.2f}")
         elif col in groups["datetime"]:
@@ -1316,7 +1335,7 @@ def render_global_filters(df: pd.DataFrame, groups: dict[str, List[str]]) -> Tup
             if len(valid) == 0:
                 continue
             dmin, dmax = valid.min().date(), valid.max().date()
-            chosen = st.sidebar.date_input(f"{col} (periodo)", value=(dmin, dmax), key=f"flt_dt_{col}")
+            chosen = st.sidebar.date_input(f"{col} (periodo)", value=(dmin, dmax), key=f"flt_dt_{filter_context}_{col}")
             if isinstance(chosen, tuple) and len(chosen) == 2:
                 start, end = chosen
                 dt = pd.to_datetime(filtered[col], errors="coerce", dayfirst=True)
@@ -1325,7 +1344,12 @@ def render_global_filters(df: pd.DataFrame, groups: dict[str, List[str]]) -> Tup
         else:
             values = filtered[col].fillna("NULO").astype(str)
             opts = values.value_counts().head(80).index.tolist()
-            selected = st.sidebar.multiselect(f"{col} (categorias)", options=opts, default=opts, key=f"flt_cat_{col}")
+            selected = st.sidebar.multiselect(
+                f"{col} (categorias)",
+                options=opts,
+                default=opts,
+                key=f"flt_cat_{filter_context}_{col}",
+            )
             filtered = filtered[values.isin(selected)]
             active.append(f"{col}: {len(selected)} categorias")
 
@@ -1335,9 +1359,9 @@ def render_global_filters(df: pd.DataFrame, groups: dict[str, List[str]]) -> Tup
 def render_data_treatment_controls() -> dict:
     st.sidebar.markdown("---")
     st.sidebar.subheader("Tratativa de Dados")
-    remove_empty_rows = st.sidebar.checkbox("Excluir linhas totalmente vazias", value=True)
-    remove_duplicates = st.sidebar.checkbox("Excluir linhas duplicadas exatas", value=True)
-    remove_outliers = st.sidebar.checkbox("Excluir outliers (IQR)", value=True)
+    remove_empty_rows = st.sidebar.checkbox("Excluir linhas totalmente vazias", value=True, key="treat_empty_rows")
+    remove_duplicates = st.sidebar.checkbox("Excluir linhas duplicadas exatas", value=True, key="treat_duplicates")
+    remove_outliers = st.sidebar.checkbox("Excluir outliers (IQR)", value=True, key="treat_outliers")
 
     outlier_iqr_multiplier = DEFAULT_OUTLIER_IQR_MULTIPLIER
     outlier_min_hits = 1
@@ -1351,6 +1375,7 @@ def render_data_treatment_controls() -> dict:
             max_value=3.0,
             value=DEFAULT_OUTLIER_IQR_MULTIPLIER,
             step=0.1,
+            key="treat_outlier_iqr_multiplier",
         )
         outlier_min_hits = st.sidebar.slider(
             "Minimo de colunas anomalas por linha",
@@ -1358,6 +1383,7 @@ def render_data_treatment_controls() -> dict:
             max_value=3,
             value=1,
             step=1,
+            key="treat_outlier_min_hits",
         )
         max_outlier_drop_pct = (
             st.sidebar.slider(
@@ -1366,6 +1392,7 @@ def render_data_treatment_controls() -> dict:
                 max_value=40,
                 value=int(DEFAULT_MAX_OUTLIER_DROP_PCT * 100),
                 step=1,
+                key="treat_max_outlier_drop_pct",
             )
             / 100.0
         )
@@ -1375,6 +1402,7 @@ def render_data_treatment_controls() -> dict:
             max_value=5000,
             value=DEFAULT_MIN_ROWS_AFTER_TREATMENT,
             step=10,
+            key="treat_min_rows_after",
         )
 
     st.sidebar.caption("A tratativa e aplicada antes da analise, do ML e dos dashboards.")
@@ -1504,7 +1532,7 @@ def apply_data_treatment(df: pd.DataFrame, options: dict) -> Tuple[pd.DataFrame,
     return treated, report
 
 
-def render_treatment_summary(report: dict) -> None:
+def render_treatment_summary(report: dict, key_prefix: str = "treatment") -> None:
     st.markdown("**Impacto da tratativa de dados**")
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Linhas originais", f"{report['rows_before']:,}".replace(",", "."))
@@ -1520,7 +1548,11 @@ def render_treatment_summary(report: dict) -> None:
             {"Etapa": "Outliers", "Removidas": int(report["outliers_removed"])},
         ]
     )
-    st.plotly_chart(px.bar(impact_df, x="Etapa", y="Removidas", text="Removidas", title="Remocoes por etapa"), use_container_width=True)
+    st.plotly_chart(
+        px.bar(impact_df, x="Etapa", y="Removidas", text="Removidas", title="Remocoes por etapa"),
+        use_container_width=True,
+        key=f"{key_prefix}_impact",
+    )
 
     if report.get("outlier_columns"):
         st.caption("Colunas com mais outliers detectados (IQR):")
@@ -1884,7 +1916,7 @@ def render_management_dashboard(
     c5.metric("Violacoes/linha", f"{violation_ratio:.1f}%")
     c6.metric("Linhas saneadas", int(treatment_report.get("total_removed", 0)))
 
-    render_treatment_summary(treatment_report)
+    render_treatment_summary(treatment_report, key_prefix=f"{key_prefix}_treatment")
 
     st.markdown("**Analise automatica da planilha**")
     dashboard_notes = build_dashboard_narrative(
@@ -2124,7 +2156,12 @@ def suggest_best_k(x_scaled: np.ndarray) -> Optional[Tuple[int, float]]:
     return (best_k, float(best_score)) if best_score >= 0 else None
 
 
-def run_unsupervised_ml(df: pd.DataFrame, numeric_cols: List[str], contamination: float = 0.05) -> Tuple[Optional[dict], pd.DataFrame]:
+def run_unsupervised_ml(
+    df: pd.DataFrame,
+    numeric_cols: List[str],
+    contamination: float = 0.05,
+    key_prefix: str = "ml_unsup",
+) -> Tuple[Optional[dict], pd.DataFrame]:
     st.subheader("Machine Learning Sem Alvo")
     if len(numeric_cols) < 2:
         st.info("ML sem alvo requer pelo menos 2 colunas numericas.")
@@ -2148,11 +2185,19 @@ def run_unsupervised_ml(df: pd.DataFrame, numeric_cols: List[str], contamination
 
     counts = pd.Series(clusters, name="cluster").value_counts().sort_index().reset_index()
     counts.columns = ["Cluster", "Quantidade"]
-    st.plotly_chart(px.bar(counts, x="Cluster", y="Quantidade", text="Quantidade", title="Distribuicao por Cluster"), use_container_width=True)
+    st.plotly_chart(
+        px.bar(counts, x="Cluster", y="Quantidade", text="Quantidade", title="Distribuicao por Cluster"),
+        use_container_width=True,
+        key=f"{key_prefix}_cluster_counts",
+    )
 
     pca = PCA(n_components=2, random_state=SEED).fit_transform(x)
     proj_df = pd.DataFrame({"PCA 1": pca[:, 0], "PCA 2": pca[:, 1], "Cluster": clusters.astype(str)})
-    st.plotly_chart(px.scatter(proj_df, x="PCA 1", y="PCA 2", color="Cluster", title="Mapa de Clusters (PCA 2D)"), use_container_width=True)
+    st.plotly_chart(
+        px.scatter(proj_df, x="PCA 1", y="PCA 2", color="Cluster", title="Mapa de Clusters (PCA 2D)"),
+        use_container_width=True,
+        key=f"{key_prefix}_cluster_map",
+    )
 
     anom_model = IsolationForest(contamination=contamination, random_state=SEED)
     flags = anom_model.fit_predict(x)
@@ -2210,8 +2255,13 @@ def detect_leakage(x: pd.DataFrame, y: pd.Series, target_col: str) -> List[dict]
     return dedup
 
 
-def run_supervised_ml(df: pd.DataFrame, target_col: str) -> Optional[dict]:
-    st.subheader("Modelo Preditivo (Opcional)")
+def run_supervised_ml(
+    df: pd.DataFrame,
+    target_col: str,
+    model_choice: str = "Random Forest",
+    key_prefix: str = "ml_sup",
+) -> Optional[dict]:
+    st.subheader("Modelo Preditivo")
     if df.shape[1] < 2:
         st.info("Necessario pelo menos duas colunas para modelo supervisionado.")
         return None
@@ -2251,6 +2301,7 @@ def run_supervised_ml(df: pd.DataFrame, target_col: str) -> Optional[dict]:
     )
 
     kind = infer_problem_type(y)
+    st.caption(f"Alvo: `{target_col}` | Tipo detectado: `{kind}` | Modelo selecionado: `{model_choice}`")
     if kind == "classification":
         if y.nunique(dropna=True) < 2:
             st.warning("Alvo para classificacao precisa ter pelo menos 2 classes.")
@@ -2259,7 +2310,10 @@ def run_supervised_ml(df: pd.DataFrame, target_col: str) -> Optional[dict]:
         min_count = int(class_counts.min()) if len(class_counts) else 1
         cv_folds = int(max(2, min(5, min_count)))
         strat = y if min_count >= 2 and y.nunique(dropna=True) <= 30 else None
-        model = RandomForestClassifier(n_estimators=300, random_state=SEED, class_weight="balanced_subsample")
+        if model_choice == "Regressao Linear / Logistica":
+            model = LogisticRegression(max_iter=1000, class_weight="balanced", random_state=SEED)
+        else:
+            model = RandomForestClassifier(n_estimators=300, random_state=SEED, class_weight="balanced_subsample")
         pipe = Pipeline(steps=[("preprocess", preprocess), ("model", model)])
         cv = cross_validate(pipe, x, y, cv=cv_folds, scoring={"acc": "accuracy", "f1": "f1_weighted"}, error_score="raise")
         x_train, x_test, y_train, y_test = train_test_split(x, y, test_size=0.2, random_state=SEED, stratify=strat)
@@ -2276,11 +2330,16 @@ def run_supervised_ml(df: pd.DataFrame, target_col: str) -> Optional[dict]:
         sample_y = y_test.loc[sample_x.index]
         imp = permutation_importance(pipe, sample_x, sample_y, scoring="f1_weighted", n_repeats=5, random_state=SEED)
         imp_df = pd.DataFrame({"feature": sample_x.columns, "importance": imp.importances_mean}).sort_values("importance", ascending=False)
-        st.plotly_chart(px.bar(imp_df.head(12), x="feature", y="importance", title="Top features (permutation importance)"), use_container_width=True)
+        st.plotly_chart(
+            px.bar(imp_df.head(12), x="feature", y="importance", title="Top features (permutation importance)"),
+            use_container_width=True,
+            key=f"{key_prefix}_classification_importance",
+        )
         st.success("Classificacao treinada com validacao cruzada e explicabilidade.")
         return {
             "problem_type": "classification",
             "target_col": target_col,
+            "model_choice": model_choice,
             "cv_accuracy": float(np.mean(cv["test_acc"])),
             "cv_f1": float(np.mean(cv["test_f1"])),
             "holdout_accuracy": float(hold_acc),
@@ -2289,7 +2348,10 @@ def run_supervised_ml(df: pd.DataFrame, target_col: str) -> Optional[dict]:
         }
 
     cv_folds = 5 if len(x) >= 100 else 3
-    model = RandomForestRegressor(n_estimators=300, random_state=SEED)
+    if model_choice == "Regressao Linear / Logistica":
+        model = LinearRegression()
+    else:
+        model = RandomForestRegressor(n_estimators=300, random_state=SEED)
     pipe = Pipeline(steps=[("preprocess", preprocess), ("model", model)])
     cv = cross_validate(
         pipe,
@@ -2316,11 +2378,16 @@ def run_supervised_ml(df: pd.DataFrame, target_col: str) -> Optional[dict]:
     sample_y = y_test.loc[sample_x.index]
     imp = permutation_importance(pipe, sample_x, sample_y, scoring="r2", n_repeats=5, random_state=SEED)
     imp_df = pd.DataFrame({"feature": sample_x.columns, "importance": imp.importances_mean}).sort_values("importance", ascending=False)
-    st.plotly_chart(px.bar(imp_df.head(12), x="feature", y="importance", title="Top features (permutation importance)"), use_container_width=True)
+    st.plotly_chart(
+        px.bar(imp_df.head(12), x="feature", y="importance", title="Top features (permutation importance)"),
+        use_container_width=True,
+        key=f"{key_prefix}_regression_importance",
+    )
     st.success("Regressao treinada com validacao cruzada e explicabilidade.")
     return {
         "problem_type": "regression",
         "target_col": target_col,
+        "model_choice": model_choice,
         "cv_r2": float(np.mean(cv["test_r2"])),
         "cv_rmse": float(-np.mean(cv["test_rmse"])),
         "cv_mae": float(-np.mean(cv["test_mae"])),
@@ -2578,14 +2645,14 @@ def build_pdf_report(
         if ml_sup["problem_type"] == "classification":
             story.append(
                 Paragraph(
-                    f"Com alvo ({ml_sup['target_col']}): CV Acuracia={ml_sup['cv_accuracy']:.3f}, CV F1={ml_sup['cv_f1']:.3f}, Holdout Acuracia={ml_sup['holdout_accuracy']:.3f}.",
+                    f"Com alvo ({ml_sup['target_col']}) usando {ml_sup.get('model_choice', 'modelo preditivo')}: CV Acuracia={ml_sup['cv_accuracy']:.3f}, CV F1={ml_sup['cv_f1']:.3f}, Holdout Acuracia={ml_sup['holdout_accuracy']:.3f}.",
                     styles["Normal"],
                 )
             )
         else:
             story.append(
                 Paragraph(
-                    f"Com alvo ({ml_sup['target_col']}): CV R2={ml_sup['cv_r2']:.3f}, CV RMSE={ml_sup['cv_rmse']:.3f}, Holdout R2={ml_sup['holdout_r2']:.3f}.",
+                    f"Com alvo ({ml_sup['target_col']}) usando {ml_sup.get('model_choice', 'modelo preditivo')}: CV R2={ml_sup['cv_r2']:.3f}, CV RMSE={ml_sup['cv_rmse']:.3f}, Holdout R2={ml_sup['holdout_r2']:.3f}.",
                     styles["Normal"],
                 )
             )
@@ -2601,7 +2668,7 @@ def main() -> None:
     ensure_data_storage()
     st.sidebar.title("AutoAnalista 2026")
     st.sidebar.caption(f"Criador do app: {CREATOR_SIGNATURE}")
-    theme = st.sidebar.selectbox("Tema visual", options=["Escuro", "Claro"], index=0)
+    theme = st.sidebar.selectbox("Tema visual", options=["Escuro", "Claro"], index=0, key="theme_selector")
     apply_theme(theme)
 
     auth = login_panel()
@@ -2613,13 +2680,18 @@ def main() -> None:
 
     role = auth["role"]
     perms = ROLE_PERMISSIONS[role]
-    area = st.sidebar.selectbox("Area de negocio", options=["Geral", "Financeiro", "Vendas", "Operacoes", "RH"], index=0)
+    area = st.sidebar.selectbox(
+        "Area de negocio",
+        options=["Geral", "Financeiro", "Vendas", "Operacoes", "RH"],
+        index=0,
+        key="business_area_selector",
+    )
 
     st.title("AutoAnalista de Dados 2026")
     st.caption("Analista profissional com qualidade, insights executivos, ML explicavel e governanca de historico.")
     st.caption(f"Assinatura do criador: {CREATOR_SIGNATURE}")
 
-    uploaded = st.file_uploader("Envie sua planilha", type=SUPPORTED_TYPES)
+    uploaded = st.file_uploader("Envie sua planilha", type=SUPPORTED_TYPES, key="uploaded_sheet")
     if uploaded is None:
         hist = load_history()
         if hist:
@@ -2632,6 +2704,7 @@ def main() -> None:
     prog = st.progress(0, text="Iniciando leitura do arquivo...")
     try:
         file_bytes = uploaded.getvalue()
+        uploaded_hash_short = hashlib.sha256(file_bytes).hexdigest()[:12]
         workbook = read_workbook(file_bytes, uploaded.name)
     except Exception as exc:
         st.error("Nao foi possivel abrir o arquivo.")
@@ -2651,7 +2724,7 @@ def main() -> None:
         sheet = list(workbook.keys())[0]
         st.caption(f"Tabela detectada automaticamente: `{sheet}`")
     else:
-        sheet = st.selectbox("Selecione a aba/tabela", options=list(workbook.keys()))
+        sheet = st.selectbox("Selecione a aba/tabela", options=list(workbook.keys()), key=f"sheet_selector_{uploaded_hash_short}")
 
     raw_df = workbook[sheet].copy()
     if raw_df.empty:
@@ -2823,6 +2896,29 @@ def main() -> None:
         f"outliers={treatment_report['outliers_removed']}."
     )
 
+    predictive_target_col = "(nao usar)"
+    predictive_model_choice = "Random Forest"
+    train_predictive_model = False
+    if perms["ml"]:
+        st.sidebar.markdown("---")
+        st.sidebar.subheader("Modelagem Preditiva")
+        st.sidebar.caption("Usa os dados ja tratados, filtrados e saneados pela analise atual.")
+        predictive_target_col = st.sidebar.selectbox(
+            "Variavel alvo para prever",
+            options=["(nao usar)"] + analysis_df.columns.tolist(),
+            key=f"predictive_target_{analysis_key}",
+        )
+        predictive_model_choice = st.sidebar.selectbox(
+            "Tipo de modelo",
+            options=["Random Forest", "Regressao Linear / Logistica"],
+            key=f"predictive_model_{analysis_key}",
+        )
+        train_predictive_model = st.sidebar.button(
+            "Treinar Modelo",
+            use_container_width=True,
+            key=f"predictive_train_{analysis_key}",
+        )
+
     tabs = st.tabs(["Resumo", "Dashboard", "Qualidade", "Insights", "ML", "Relatorio"])
 
     with tabs[0]:
@@ -2834,7 +2930,7 @@ def main() -> None:
         c4.metric("Score", f"{quality['score']:.1f}")
         c5.metric("Semaforo", quality_status(quality["score"]))
         c6.metric("Linhas removidas", int(treatment_report["total_removed"]))
-        render_quality_overview(quality, groups)
+        render_quality_overview(quality, groups, key_prefix=f"summary_quality_{analysis_key}")
         st.subheader("Preview")
         st.dataframe(analysis_df.head(80), use_container_width=True)
 
@@ -2862,6 +2958,7 @@ def main() -> None:
             st.plotly_chart(
                 px.bar(miss_df.head(20), x="coluna", y="percentual_ausente", title="Percentual de ausencia por coluna (Top 20)"),
                 use_container_width=True,
+                key=f"quality_missing_{analysis_key}",
             )
 
     with tabs[3]:
@@ -2887,7 +2984,11 @@ def main() -> None:
             st.markdown("**Correlacoes de destaque**")
             st.dataframe(top_corr, use_container_width=True)
             corr_matrix = analysis_df[groups["numeric"]].corr(numeric_only=True)
-            st.plotly_chart(px.imshow(corr_matrix, text_auto=True, aspect="auto", title="Matriz de correlacao"), use_container_width=True)
+            st.plotly_chart(
+                px.imshow(corr_matrix, text_auto=True, aspect="auto", title="Matriz de correlacao"),
+                use_container_width=True,
+                key=f"insights_corr_{analysis_key}",
+            )
 
     ml_unsup = None
     ml_sup = None
@@ -2895,6 +2996,13 @@ def main() -> None:
     with tabs[4]:
         if perms["ml"]:
             st.caption("Execucao sob demanda: rode ML apenas quando necessario.")
+            st.markdown("**Modelagem Preditiva**")
+            st.info(
+                "Configure a variavel alvo e o tipo de modelo na secao `Modelagem Preditiva` do sidebar. "
+                "O treinamento usa o dataframe principal ja tratado."
+            )
+            st.write(f"Alvo selecionado: `{predictive_target_col}`")
+            st.write(f"Modelo selecionado: `{predictive_model_choice}`")
             contamination = st.slider(
                 "Taxa de anomalias (ML sem alvo)",
                 min_value=0.01,
@@ -2903,21 +3011,23 @@ def main() -> None:
                 step=0.01,
                 key=f"contamination_{analysis_key}",
             )
-            target_col = st.selectbox(
-                "Coluna alvo (ML supervisionado)",
-                options=["(nao usar)"] + analysis_df.columns.tolist(),
-                key=f"target_{analysis_key}",
-            )
 
             c1, c2 = st.columns(2)
             run_unsup = c1.button("Executar ML Sem Alvo", use_container_width=True, key=f"run_unsup_{analysis_key}")
-            run_sup = c2.button("Executar ML Supervisionado", use_container_width=True, key=f"run_sup_{analysis_key}")
+            run_sup_tab = c2.button("Treinar Modelo Agora", use_container_width=True, key=f"run_sup_{analysis_key}")
+            run_sup = train_predictive_model or run_sup_tab
 
             unsup_cache_key = f"{analysis_key}::unsup::{contamination:.2f}"
-            sup_cache_key = f"{analysis_key}::sup::{target_col}"
+            sup_cache_key = f"{analysis_key}::sup::{predictive_target_col}::{predictive_model_choice}"
+            model_key_suffix = re.sub(r"[^A-Za-z0-9_]+", "_", predictive_model_choice).strip("_").lower()
 
             if run_unsup:
-                ml_unsup, anomalias_df = run_unsupervised_ml(analysis_df, groups["numeric"], contamination=contamination)
+                ml_unsup, anomalias_df = run_unsupervised_ml(
+                    analysis_df,
+                    groups["numeric"],
+                    contamination=contamination,
+                    key_prefix=f"unsup_{analysis_key}",
+                )
                 st.session_state.ml_cache[unsup_cache_key] = {"summary": ml_unsup, "anomalias": anomalias_df}
             elif unsup_cache_key in st.session_state.ml_cache:
                 cached = st.session_state.ml_cache[unsup_cache_key]
@@ -2928,7 +3038,12 @@ def main() -> None:
                     st.metric("Anomalias detectadas (cache)", ml_unsup["anomalias"])
 
             if run_sup:
-                ml_sup = run_supervised_ml(analysis_df, target_col=target_col)
+                ml_sup = run_supervised_ml(
+                    analysis_df,
+                    target_col=predictive_target_col,
+                    model_choice=predictive_model_choice,
+                    key_prefix=f"sup_{analysis_key}_{model_key_suffix}",
+                )
                 st.session_state.ml_cache[sup_cache_key] = {"summary": ml_sup}
             elif sup_cache_key in st.session_state.ml_cache:
                 cached_sup = st.session_state.ml_cache[sup_cache_key]
