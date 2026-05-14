@@ -1,9 +1,11 @@
 import hashlib
+import html
 import hmac
 import io
 import json
 import os
 import re
+import unicodedata
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -13,10 +15,13 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+from reportlab.graphics.charts.barcharts import HorizontalBarChart, VerticalBarChart
+from reportlab.graphics.charts.piecharts import Pie
+from reportlab.graphics.shapes import Drawing, String
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet
-from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+from reportlab.platypus import PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 from sklearn.cluster import KMeans
 from sklearn.compose import ColumnTransformer
 from sklearn.decomposition import PCA
@@ -51,6 +56,26 @@ DEFAULT_MIN_ROWS_AFTER_TREATMENT = 40
 CREATOR_SIGNATURE = "Walace.gorino"
 ML_MISSING_CATEGORY = "__NULO__"
 ML_OTHER_CATEGORY = "__OUTROS__"
+ID_NAME_TOKENS = {
+    "id",
+    "ids",
+    "cod",
+    "codigo",
+    "chamado",
+    "ticket",
+    "protocolo",
+    "contrato",
+    "cpf",
+    "cnpj",
+    "os",
+    "ordem",
+    "matricula",
+    "registro",
+    "numero",
+    "nro",
+    "serial",
+}
+ID_NAME_PREFIXES = ("id_", "cod_", "cod", "codigo_", "chamado", "ticket", "protocolo", "cpf", "cnpj")
 
 ROLE_PERMISSIONS = {
     "admin": {"ml": True, "export": True, "rules": True},
@@ -68,6 +93,28 @@ st.set_page_config(page_title="AutoAnalista 2026", page_icon="📊", layout="wid
 
 def hash_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def normalize_token_text(value: object) -> str:
+    text = str(value)
+    text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
+    text = re.sub(r"[^A-Za-z0-9]+", "_", text.lower()).strip("_")
+    return re.sub(r"_+", "_", text)
+
+
+def clean_report_text(value: object, max_len: int = 180) -> str:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return "-"
+    text = unicodedata.normalize("NFKD", str(value)).encode("ascii", "ignore").decode("ascii")
+    text = re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text:
+        text = "-"
+    return text[: max_len - 3] + "..." if len(text) > max_len else text
+
+
+def pdf_paragraph(text: object, style) -> Paragraph:
+    return Paragraph(html.escape(clean_report_text(text, max_len=2000)), style)
 
 
 def sync_session_value(source_key: str, state_key: str, mirror_key: Optional[str] = None) -> None:
@@ -496,8 +543,31 @@ def detect_id_like_columns(df: pd.DataFrame) -> List[str]:
         non_null = df[col].dropna()
         if len(non_null) < 20:
             continue
+        col_key = normalize_token_text(col)
+        name_tokens = set(col_key.split("_"))
+        name_looks_like_id = (
+            bool(name_tokens.intersection(ID_NAME_TOKENS))
+            or any(col_key.startswith(prefix) for prefix in ID_NAME_PREFIXES)
+            or col_key.endswith("_id")
+        )
         unique_ratio = non_null.nunique(dropna=True) / max(len(non_null), 1)
-        if unique_ratio >= 0.95 and (pd.api.types.is_integer_dtype(df[col]) or df[col].dtype == "object"):
+        numeric_values = pd.to_numeric(non_null, errors="coerce")
+        numeric_ratio = float(numeric_values.notna().mean()) if len(non_null) else 0.0
+        integer_like = False
+        large_code_like = False
+        if numeric_ratio >= 0.9:
+            numeric_clean = numeric_values.dropna()
+            if len(numeric_clean) > 0:
+                integer_like = bool(np.isclose(numeric_clean, np.round(numeric_clean)).mean() >= 0.98)
+                large_code_like = bool(numeric_clean.abs().median() >= 1000 and integer_like)
+
+        if name_looks_like_id:
+            out.append(col)
+            continue
+        if unique_ratio >= 0.95 and (integer_like or df[col].dtype == "object"):
+            out.append(col)
+            continue
+        if unique_ratio >= 0.75 and large_code_like:
             out.append(col)
     return out
 
@@ -994,16 +1064,44 @@ def period_comparison(df: pd.DataFrame, date_col: str, value_col: str, agg_mode:
 def detect_kpis(df: pd.DataFrame, groups: dict[str, List[str]]) -> List[dict]:
     kpis = []
     metric_numeric, id_like_cols = select_numeric_metric_columns(df, groups)
+    date_col = max(groups["datetime"], key=lambda c: df[c].notna().sum()) if groups["datetime"] else None
+
+    volume_col = pick_volume_id_column(df, id_like_cols)
+    if volume_col:
+        comp = period_comparison(df, date_col, volume_col, agg_mode="nunique") if date_col else None
+        item = {
+            "name": f"IDs unicos ({volume_col})",
+            "metric": float(df[volume_col].nunique(dropna=True)),
+            "value_type": "count",
+            "delta_text": "",
+            "alert": "",
+            "comparison": comp,
+        }
+        if comp:
+            item["delta_text"] = comp["delta_txt"]
+            if comp["delta_pct"] is not None and abs(comp["delta_pct"]) >= 15:
+                item["alert"] = "Variacao relevante detectada"
+        kpis.append(item)
+    elif len(df) > 0:
+        item = {
+            "name": "Volume de linhas",
+            "metric": float(len(df)),
+            "value_type": "count",
+            "delta_text": "",
+            "alert": "",
+            "comparison": None,
+        }
+        kpis.append(item)
+
     candidates = sorted(
         metric_numeric,
         key=lambda c: (df[c].notna().sum(), df[c].var(skipna=True) if pd.notna(df[c].var(skipna=True)) else -1),
         reverse=True,
     )[:3]
-    date_col = max(groups["datetime"], key=lambda c: df[c].notna().sum()) if groups["datetime"] else None
 
     for col in candidates:
         item = {
-            "name": col,
+            "name": f"Media de {col}",
             "metric": float(df[col].mean(skipna=True)) if df[col].notna().sum() else 0.0,
             "value_type": "avg",
             "delta_text": "",
@@ -1019,38 +1117,7 @@ def detect_kpis(df: pd.DataFrame, groups: dict[str, List[str]]) -> List[dict]:
                     item["alert"] = "Variacao relevante detectada"
         kpis.append(item)
 
-    volume_col = pick_volume_id_column(df, id_like_cols)
-    if date_col and volume_col:
-        comp = period_comparison(df, date_col, volume_col, agg_mode="nunique")
-        volume_metric = int(df[volume_col].nunique(dropna=True))
-        item = {
-            "name": f"Volume de registros ({volume_col})",
-            "metric": float(volume_metric),
-            "value_type": "count",
-            "delta_text": "",
-            "alert": "",
-            "comparison": comp,
-        }
-        if comp:
-            item["delta_text"] = comp["delta_txt"]
-            if comp["delta_pct"] is not None and abs(comp["delta_pct"]) >= 15:
-                item["alert"] = "Variacao relevante detectada"
-        kpis.insert(0, item)
-    elif date_col and not kpis:
-        proxy_col = groups["datetime"][0]
-        comp = period_comparison(df, date_col, proxy_col, agg_mode="count")
-        item = {
-            "name": "Volume de linhas",
-            "metric": float(len(df)),
-            "value_type": "count",
-            "delta_text": "",
-            "alert": "",
-            "comparison": comp,
-        }
-        if comp:
-            item["delta_text"] = comp["delta_txt"]
-        kpis.append(item)
-    return kpis
+    return kpis[:4]
 
 
 def generate_professional_insights(
@@ -1107,40 +1174,65 @@ def generate_professional_insights(
 
 
 def build_action_plan(area: str, quality_report: dict, issue_catalog: pd.DataFrame) -> List[str]:
-    area_map = {
-        "Geral": [
-            "Instituir checklist de qualidade antes da publicacao de dados.",
-            "Monitorar semanalmente os 5 pilares de qualidade.",
-        ],
-        "Financeiro": [
-            "Validar limites de valor para prevenir lancamentos indevidos.",
-            "Auditar datas futuras e negativos em metricas sensiveis.",
-        ],
-        "Vendas": [
-            "Padronizar cadastro de clientes para reduzir duplicidade.",
-            "Monitorar variacao de ticket medio por periodo.",
-        ],
-        "Operacoes": [
-            "Controlar SLA com alertas por data e status inconsistente.",
-            "Padronizar codigos de falha para reduzir ambiguidade.",
-        ],
-        "RH": [
-            "Validar consistencia de datas de admissao/desligamento.",
-            "Padronizar campos obrigatorios de cadastro de colaborador.",
-        ],
-    }
-    plan = list(area_map.get(area, area_map["Geral"]))
-    plan.extend(quality_report["actions"][:3])
+    action_df = build_structured_action_plan(area, quality_report, issue_catalog)
+    return [
+        f"{row['prioridade']} | Impacto: {row['impacto']} | Acao: {row['acao']} | Prazo: {row['prazo']}"
+        for _, row in action_df.head(8).iterrows()
+    ]
+
+
+def build_structured_action_plan(area: str, quality_report: dict, issue_catalog: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    priority_rank = {"critical": "P0", "high": "P1", "medium": "P2", "low": "P3"}
+
     if len(issue_catalog) > 0:
-        top = issue_catalog.sort_values(["priority_rank", "affected_rows"], ascending=[True, False]).iloc[0]
-        plan.append(f"Priorizar correcao de `{top['issue']}` na coluna `{top['column']}`.")
+        sorted_issues = issue_catalog.sort_values(["priority_rank", "affected_rows"], ascending=[True, False]).head(6)
+        for _, row in sorted_issues.iterrows():
+            pri = priority_rank.get(str(row.get("priority", "medium")).lower(), "P2")
+            issue = clean_report_text(row.get("issue", "-"), 80)
+            column = clean_report_text(row.get("column", "-"), 80)
+            affected = int(row.get("affected_rows", 0) or 0)
+            pct = row.get("affected_pct", None)
+            pct_txt = f" ({float(pct):.1f}%)" if pct is not None and pd.notna(pct) else ""
+            rows.append(
+                {
+                    "prioridade": pri,
+                    "foco": f"{issue} - {column}",
+                    "impacto": f"{affected:,} registros afetados{pct_txt}".replace(",", "."),
+                    "acao": clean_report_text(row.get("suggestion", "Corrigir a causa raiz na origem dos dados."), 140),
+                    "prazo": "0-7 dias" if pri in ["P0", "P1"] else "8-30 dias",
+                }
+            )
+
+    area_actions = {
+        "Geral": ("Governanca de dados", "Reduz retrabalho e aumenta confianca gerencial.", "Criar checklist de qualidade antes da publicacao de dados."),
+        "Financeiro": ("Controle financeiro", "Reduz risco de valores incorretos e auditoria manual.", "Validar limites, negativos e datas futuras em metricas sensiveis."),
+        "Vendas": ("Cadastro e receita", "Melhora leitura de funil, carteira e ticket.", "Padronizar cadastro de clientes e acompanhar ticket medio por periodo."),
+        "Operacoes": ("SLA e atendimento", "Ajuda a priorizar gargalos e reincidencias.", "Padronizar status, falhas e datas de atendimento."),
+        "RH": ("Cadastro de pessoas", "Evita inconsistencias em headcount e movimentacoes.", "Padronizar campos obrigatorios e datas de admissao/desligamento."),
+    }
+    foco, impacto, acao = area_actions.get(area, area_actions["Geral"])
+    rows.append({"prioridade": "P2", "foco": foco, "impacto": impacto, "acao": acao, "prazo": "8-30 dias"})
+
+    for action in quality_report.get("actions", [])[:3]:
+        rows.append(
+            {
+                "prioridade": "P2",
+                "foco": "Qualidade de dados",
+                "impacto": "Mantem os 5 pilares de qualidade sob controle.",
+                "acao": clean_report_text(action, 140),
+                "prazo": "Recorrente",
+            }
+        )
+
     dedup = []
     seen = set()
-    for p in plan:
-        if p not in seen:
-            dedup.append(p)
-            seen.add(p)
-    return dedup[:8]
+    for row in rows:
+        key = (row["prioridade"], row["foco"], row["acao"])
+        if key not in seen:
+            dedup.append(row)
+            seen.add(key)
+    return pd.DataFrame(dedup[:8])
 
 
 def compute_column_quality(df: pd.DataFrame, violations: pd.DataFrame, mixed_cols: List[str]) -> pd.DataFrame:
@@ -1761,7 +1853,7 @@ def build_dashboard_export_bundle(
         dist = df[cat_col].fillna("NULO").astype(str).value_counts().head(15).reset_index()
         dist.columns = ["categoria", "quantidade"]
         dist["coluna_categoria"] = cat_col
-        dist["participacao_pct"] = (dist["quantidade"] / max(dist["quantidade"].sum(), 1) * 100.0).round(2)
+        dist["participacao_pct"] = (dist["quantidade"] / max(len(df), 1) * 100.0).round(2)
         top_categories_df = dist[["coluna_categoria", "categoria", "quantidade", "participacao_pct"]]
 
         if metric_numeric:
@@ -2538,6 +2630,138 @@ def generate_excel_export(
     return buffer.getvalue()
 
 
+def pdf_table(data: List[List[object]], col_widths: List[int], header_color: str = "#1F4E79", font_size: int = 8) -> Table:
+    clean_data = [[clean_report_text(cell, 120) for cell in row] for row in data]
+    table = Table(clean_data, colWidths=col_widths, repeatRows=1)
+    table.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor(header_color)),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                ("GRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#CBD5E1")),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("FONTSIZE", (0, 0), (-1, -1), font_size),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F8FAFC")]),
+            ]
+        )
+    )
+    return table
+
+
+def make_horizontal_bar_chart(
+    labels: List[object],
+    values: List[object],
+    title: str,
+    width: int = 500,
+    height: int = 210,
+    color: str = "#4EA3F1",
+) -> Optional[Drawing]:
+    pairs = []
+    for label, value in zip(labels, values):
+        try:
+            val = float(value)
+        except Exception:
+            continue
+        if pd.notna(val):
+            pairs.append((clean_report_text(label, 34), val))
+    pairs = pairs[:8]
+    if not pairs:
+        return None
+    pairs = list(reversed(pairs))
+    chart = HorizontalBarChart()
+    chart.x = 150
+    chart.y = 25
+    chart.height = height - 62
+    chart.width = width - 185
+    chart.data = [[p[1] for p in pairs]]
+    chart.categoryAxis.categoryNames = [p[0] for p in pairs]
+    chart.categoryAxis.labels.fontSize = 6
+    chart.valueAxis.labels.fontSize = 7
+    chart.valueAxis.valueMin = 0
+    chart.valueAxis.valueMax = max(p[1] for p in pairs) * 1.15 if max(p[1] for p in pairs) > 0 else 1
+    chart.bars[0].fillColor = colors.HexColor(color)
+    drawing = Drawing(width, height)
+    drawing.add(String(0, height - 18, clean_report_text(title, 90), fontSize=10, fillColor=colors.HexColor("#0F172A")))
+    drawing.add(chart)
+    return drawing
+
+
+def make_vertical_bar_chart(
+    labels: List[object],
+    values: List[object],
+    title: str,
+    width: int = 500,
+    height: int = 210,
+    color: str = "#1B7F5A",
+) -> Optional[Drawing]:
+    pairs = []
+    for label, value in zip(labels, values):
+        try:
+            val = float(value)
+        except Exception:
+            continue
+        if pd.notna(val):
+            pairs.append((clean_report_text(label, 12), val))
+    pairs = pairs[-10:]
+    if not pairs:
+        return None
+    chart = VerticalBarChart()
+    chart.x = 35
+    chart.y = 35
+    chart.height = height - 75
+    chart.width = width - 60
+    chart.data = [[p[1] for p in pairs]]
+    chart.categoryAxis.categoryNames = [p[0] for p in pairs]
+    chart.categoryAxis.labels.fontSize = 6
+    chart.categoryAxis.labels.angle = 30
+    chart.valueAxis.labels.fontSize = 7
+    chart.valueAxis.valueMin = 0
+    chart.valueAxis.valueMax = max(p[1] for p in pairs) * 1.15 if max(p[1] for p in pairs) > 0 else 1
+    chart.bars[0].fillColor = colors.HexColor(color)
+    drawing = Drawing(width, height)
+    drawing.add(String(0, height - 18, clean_report_text(title, 90), fontSize=10, fillColor=colors.HexColor("#0F172A")))
+    drawing.add(chart)
+    return drawing
+
+
+def make_pie_chart(labels: List[object], values: List[object], title: str, width: int = 500, height: int = 210) -> Optional[Drawing]:
+    pairs = []
+    for label, value in zip(labels, values):
+        try:
+            val = float(value)
+        except Exception:
+            continue
+        if pd.notna(val) and val > 0:
+            pairs.append((clean_report_text(label, 24), val))
+    if not pairs:
+        return None
+    top = pairs[:6]
+    if len(pairs) > 6:
+        top.append(("Outros", sum(v for _, v in pairs[6:])))
+    pie = Pie()
+    pie.x = 35
+    pie.y = 25
+    pie.width = 145
+    pie.height = 145
+    pie.data = [p[1] for p in top]
+    pie.labels = [p[0] for p in top]
+    pie.sideLabels = 1
+    palette = ["#4EA3F1", "#1B7F5A", "#F59E0B", "#EF4444", "#8B5CF6", "#14B8A6", "#94A3B8"]
+    for i, color in enumerate(palette[: len(top)]):
+        pie.slices[i].fillColor = colors.HexColor(color)
+    drawing = Drawing(width, height)
+    drawing.add(String(0, height - 18, clean_report_text(title, 90), fontSize=10, fillColor=colors.HexColor("#0F172A")))
+    drawing.add(pie)
+    return drawing
+
+
+def append_if_chart(story: List[object], chart: Optional[Drawing]) -> None:
+    if chart is not None:
+        story.append(chart)
+        story.append(Spacer(1, 8))
+
+
 def build_pdf_report(
     *,
     source_name: str,
@@ -2551,185 +2775,238 @@ def build_pdf_report(
     ml_sup: Optional[dict],
     version: int,
     dashboard_bundle: Optional[dict] = None,
+    treatment_report: Optional[dict] = None,
+    active_filters: Optional[List[str]] = None,
+    area: str = "Geral",
 ) -> bytes:
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=A4, leftMargin=36, rightMargin=36, topMargin=36, bottomMargin=36)
     styles = getSampleStyleSheet()
     story = []
 
-    story.append(Paragraph("Relatorio Profissional AutoAnalista 2026", styles["Title"]))
-    story.append(Paragraph(f"Arquivo: {source_name}", styles["Normal"]))
-    story.append(Paragraph(f"Aba/Tabela: {sheet_name}", styles["Normal"]))
-    story.append(Paragraph(f"Versao: v{version}", styles["Normal"]))
-    story.append(Paragraph(f"Criador do app: {CREATOR_SIGNATURE}", styles["Normal"]))
-    story.append(Paragraph(f"Gerado em: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}", styles["Normal"]))
-    story.append(Spacer(1, 10))
+    score = float(quality_report.get("score", 0.0))
+    level = str(quality_report.get("level", "-"))
+    summary_df = dashboard_bundle.get("summary_df", pd.DataFrame()) if dashboard_bundle else pd.DataFrame()
+    summary_map = dict(zip(summary_df.get("metrica", []), summary_df.get("valor", []))) if len(summary_df) > 0 else {}
+    rows_analyzed = summary_map.get("linhas_analisadas", treatment_report.get("rows_after", "-") if treatment_report else "-")
+    cols_analyzed = summary_map.get("colunas_analisadas", "-")
+    risk_count = summary_map.get("riscos_criticos_altos", 0)
 
-    story.append(Paragraph("Qualidade por pilares", styles["Heading2"]))
-    quality_table = Table([["Pilar", "Score"]] + [[k, f"{v:.1f}"] for k, v in quality_report["pillars"].items()], colWidths=[230, 210])
-    quality_table.setStyle(
+    cover = Table(
+        [
+            [pdf_paragraph("AutoAnalista 2026", styles["Title"])],
+            [pdf_paragraph("Relatorio Executivo de Analise de Dados", styles["Heading2"])],
+            [pdf_paragraph(f"Arquivo: {source_name} | Tabela: {sheet_name} | Versao: v{version}", styles["Normal"])],
+            [pdf_paragraph(f"Criador: {CREATOR_SIGNATURE} | Gerado em: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}", styles["Normal"])],
+        ],
+        colWidths=[500],
+    )
+    cover.setStyle(
         TableStyle(
             [
-                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1F4E79")),
-                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-                ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
-                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#EAF4FF")),
+                ("BOX", (0, 0), (-1, -1), 1.0, colors.HexColor("#1F4E79")),
+                ("LEFTPADDING", (0, 0), (-1, -1), 16),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 16),
+                ("TOPPADDING", (0, 0), (-1, -1), 10),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 10),
             ]
         )
     )
-    story.append(quality_table)
+    story.append(cover)
+    story.append(Spacer(1, 12))
+
+    executive_metrics = [
+        ["Indicador", "Resultado"],
+        ["Score de qualidade", f"{score:.1f}/100 ({level})"],
+        ["Linhas analisadas", f"{rows_analyzed}"],
+        ["Colunas analisadas", f"{cols_analyzed}"],
+        ["Riscos criticos/altos", f"{risk_count}"],
+    ]
+    if treatment_report:
+        executive_metrics.append(["Linhas removidas na tratativa", str(treatment_report.get("total_removed", 0))])
+    story.append(pdf_table(executive_metrics, [240, 240], header_color="#0F6E9A", font_size=9))
     story.append(Spacer(1, 10))
 
-    story.append(Paragraph("Insights principais", styles["Heading2"]))
+    if active_filters:
+        story.append(pdf_paragraph("Filtros aplicados: " + " | ".join(active_filters[:8]), styles["Normal"]))
+        story.append(Spacer(1, 6))
+
+    story.append(pdf_paragraph("Resumo executivo", styles["Heading2"]))
     for i in insights[:8]:
-        story.append(Paragraph(f"- {i}", styles["Normal"]))
+        story.append(pdf_paragraph(f"- {i}", styles["Normal"]))
     story.append(Spacer(1, 8))
 
-    story.append(Paragraph("Plano de acao", styles["Heading2"]))
-    for r in recommendations[:8]:
-        story.append(Paragraph(f"- {r}", styles["Normal"]))
+    story.append(pdf_paragraph("Plano de acao gerencial", styles["Heading2"]))
+    action_df = build_structured_action_plan(area, quality_report, issue_catalog)
+    action_data = [["Prioridade", "Foco", "Impacto", "Acao", "Prazo"]]
+    for _, row in action_df.head(6).iterrows():
+        action_data.append([row["prioridade"], row["foco"], row["impacto"], row["acao"], row["prazo"]])
+    story.append(pdf_table(action_data, [55, 105, 115, 160, 65], header_color="#B45309", font_size=7))
     story.append(Spacer(1, 8))
 
-    story.append(Paragraph("Correlacoes de destaque", styles["Heading2"]))
+    story.append(PageBreak())
+
+    story.append(pdf_paragraph("Qualidade e Graficos Executivos", styles["Heading2"]))
+    quality_data = [["Pilar", "Score"]] + [[k, f"{v:.1f}"] for k, v in quality_report["pillars"].items()]
+    story.append(pdf_table(quality_data, [250, 120], header_color="#1F4E79", font_size=9))
+    append_if_chart(
+        story,
+        make_horizontal_bar_chart(
+            list(quality_report["pillars"].keys()),
+            list(quality_report["pillars"].values()),
+            "Score por pilar de qualidade",
+            color="#1F4E79",
+        ),
+    )
+
+    if treatment_report:
+        treatment_data = [
+            ["Etapa", "Quantidade"],
+            ["Linhas antes", treatment_report.get("rows_before", 0)],
+            ["Linhas depois", treatment_report.get("rows_after", 0)],
+            ["Vazias removidas", treatment_report.get("empty_rows_removed", 0)],
+            ["Duplicadas removidas", treatment_report.get("duplicates_removed", 0)],
+            ["Outliers removidos", treatment_report.get("outliers_removed", 0)],
+        ]
+        story.append(pdf_paragraph("Tratativa dos dados", styles["Heading3"]))
+        story.append(pdf_table(treatment_data, [240, 120], header_color="#334155", font_size=8))
+        story.append(Spacer(1, 8))
+
+    story.append(pdf_paragraph("Correlacoes de destaque", styles["Heading2"]))
     if len(top_corr) > 0:
         data = [["Variavel 1", "Variavel 2", "Correlacao"]]
         for _, row in top_corr.head(8).iterrows():
-            data.append([str(row["variavel_1"]), str(row["variavel_2"]), f"{row['correlacao']:.3f}"])
-        table = Table(data, colWidths=[170, 170, 100])
-        table.setStyle(
-            TableStyle(
-                [
-                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#3A6EA5")),
-                    ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-                    ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
-                    ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-                ]
-            )
+            data.append([row["variavel_1"], row["variavel_2"], f"{row['correlacao']:.3f}"])
+        story.append(pdf_table(data, [170, 170, 100], header_color="#3A6EA5", font_size=8))
+        append_if_chart(
+            story,
+            make_horizontal_bar_chart(
+                [f"{row['variavel_1']} x {row['variavel_2']}" for _, row in top_corr.head(6).iterrows()],
+                [abs(float(row["correlacao"])) for _, row in top_corr.head(6).iterrows()],
+                "Forca das principais correlacoes",
+                color="#3A6EA5",
+            ),
         )
-        story.append(table)
     else:
-        story.append(Paragraph("Sem correlacoes calculaveis.", styles["Normal"]))
+        story.append(pdf_paragraph("Sem correlacoes calculaveis.", styles["Normal"]))
     story.append(Spacer(1, 8))
 
-    story.append(Paragraph("Catalogo de problemas (top)", styles["Heading2"]))
+    story.append(pdf_paragraph("Catalogo de problemas (top)", styles["Heading2"]))
     if len(issue_catalog) > 0:
         data = [["Prioridade", "Problema", "Coluna", "Afetados"]]
         for _, row in issue_catalog.sort_values(["priority_rank", "affected_rows"], ascending=[True, False]).head(8).iterrows():
-            data.append([str(row["priority"]), str(row["issue"]), str(row["column"]), str(row["affected_rows"])])
-        table = Table(data, colWidths=[90, 180, 120, 70])
-        table.setStyle(
-            TableStyle(
-                [
-                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#7A4EAB")),
-                    ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-                    ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
-                    ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-                ]
-            )
-        )
-        story.append(table)
+            data.append([row["priority"], row["issue"], row["column"], str(row["affected_rows"])])
+        story.append(pdf_table(data, [80, 170, 130, 70], header_color="#7A4EAB", font_size=8))
     else:
-        story.append(Paragraph("Sem problemas catalogados.", styles["Normal"]))
+        story.append(pdf_paragraph("Sem problemas catalogados.", styles["Normal"]))
     story.append(Spacer(1, 8))
 
     if dashboard_bundle:
-        story.append(Paragraph("Analise do Dashboard", styles["Heading2"]))
+        story.append(PageBreak())
+        story.append(pdf_paragraph("Analise do Dashboard", styles["Heading2"]))
         narrative_df = dashboard_bundle.get("narrative_df", pd.DataFrame())
         if len(narrative_df) > 0:
             for _, row in narrative_df.head(8).iterrows():
-                story.append(Paragraph(f"- {row['analise']}", styles["Normal"]))
+                story.append(pdf_paragraph(f"- {row['analise']}", styles["Normal"]))
         else:
-            story.append(Paragraph("Sem narrativa analitica disponivel.", styles["Normal"]))
+            story.append(pdf_paragraph("Sem narrativa analitica disponivel.", styles["Normal"]))
         story.append(Spacer(1, 6))
 
         kpi_df = dashboard_bundle.get("kpi_df", pd.DataFrame())
         if len(kpi_df) > 0:
-            story.append(Paragraph("KPIs do Dashboard", styles["Heading3"]))
+            story.append(pdf_paragraph("KPIs do Dashboard", styles["Heading3"]))
             kpi_data = [["KPI", "Valor", "Variacao", "Alerta"]]
             for _, row in kpi_df.head(8).iterrows():
-                kpi_data.append([str(row.get("kpi", "-")), str(row.get("valor", "-")), str(row.get("variacao_recente", "-")), str(row.get("alerta", "-"))])
-            kpi_table = Table(kpi_data, colWidths=[150, 70, 140, 120])
-            kpi_table.setStyle(
-                TableStyle(
-                    [
-                        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0F6E9A")),
-                        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-                        ("GRID", (0, 0), (-1, -1), 0.4, colors.grey),
-                        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-                    ]
-                )
-            )
-            story.append(kpi_table)
+                kpi_data.append([row.get("kpi", "-"), row.get("valor", "-"), row.get("variacao_recente", "-"), row.get("alerta", "-")])
+            story.append(pdf_table(kpi_data, [150, 70, 140, 120], header_color="#0F6E9A", font_size=8))
             story.append(Spacer(1, 6))
 
         top_cat_df = dashboard_bundle.get("top_categories_df", pd.DataFrame())
         if len(top_cat_df) > 0:
-            story.append(Paragraph("Top categorias extraidas", styles["Heading3"]))
+            story.append(pdf_paragraph("Top categorias extraidas", styles["Heading3"]))
+            append_if_chart(
+                story,
+                make_pie_chart(
+                    top_cat_df["categoria"].head(10).tolist(),
+                    top_cat_df["quantidade"].head(10).tolist(),
+                    "Participacao das principais categorias",
+                ),
+            )
+            append_if_chart(
+                story,
+                make_horizontal_bar_chart(
+                    top_cat_df["categoria"].head(10).tolist(),
+                    top_cat_df["quantidade"].head(10).tolist(),
+                    "Top categorias por quantidade",
+                    color="#1B7F5A",
+                ),
+            )
             cat_data = [["Categoria", "Quantidade", "Participacao %"]]
             for _, row in top_cat_df.head(8).iterrows():
-                cat_data.append([str(row.get("categoria", "-")), str(row.get("quantidade", "-")), f"{float(row.get('participacao_pct', 0.0)):.2f}%"])
-            cat_table = Table(cat_data, colWidths=[220, 100, 120])
-            cat_table.setStyle(
-                TableStyle(
-                    [
-                        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1B7F5A")),
-                        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-                        ("GRID", (0, 0), (-1, -1), 0.4, colors.grey),
-                        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-                    ]
-                )
-            )
-            story.append(cat_table)
+                cat_data.append([row.get("categoria", "-"), row.get("quantidade", "-"), f"{float(row.get('participacao_pct', 0.0)):.2f}%"])
+            story.append(pdf_table(cat_data, [220, 100, 120], header_color="#1B7F5A", font_size=8))
             story.append(Spacer(1, 6))
+
+        metric_cat_df = dashboard_bundle.get("metric_by_category_df", pd.DataFrame())
+        if len(metric_cat_df) > 0:
+            metric_name = str(metric_cat_df["coluna_metrica"].iloc[0]) if "coluna_metrica" in metric_cat_df.columns else "metrica"
+            append_if_chart(
+                story,
+                make_horizontal_bar_chart(
+                    metric_cat_df["categoria"].head(10).tolist(),
+                    metric_cat_df["valor_metrica"].head(10).tolist(),
+                    f"Comparativo por categoria - {metric_name}",
+                    color="#F59E0B",
+                ),
+            )
 
         trend_df = dashboard_bundle.get("trend_df", pd.DataFrame())
         if len(trend_df) > 0:
-            story.append(Paragraph("Tendencia temporal extraida", styles["Heading3"]))
+            story.append(pdf_paragraph("Tendencia temporal extraida", styles["Heading3"]))
+            append_if_chart(
+                story,
+                make_vertical_bar_chart(
+                    trend_df.iloc[:, 0].tail(10).astype(str).tolist(),
+                    trend_df["valor"].tail(10).tolist(),
+                    dashboard_bundle.get("trend_label", "Tendencia temporal"),
+                    color="#8A6D1F",
+                ),
+            )
             trend_cols = trend_df.columns.tolist()
             trend_data = [[str(trend_cols[0]), "Indicador", "Valor"]]
             for _, row in trend_df.tail(10).iterrows():
                 trend_data.append([str(row.iloc[0]), str(row.get("indicador", "-")), f"{float(row.get('valor', 0.0)):.2f}"])
-            trend_table = Table(trend_data, colWidths=[150, 190, 100])
-            trend_table.setStyle(
-                TableStyle(
-                    [
-                        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#8A6D1F")),
-                        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-                        ("GRID", (0, 0), (-1, -1), 0.4, colors.grey),
-                        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-                    ]
-                )
-            )
-            story.append(trend_table)
+            story.append(pdf_table(trend_data, [150, 190, 100], header_color="#8A6D1F", font_size=8))
             story.append(Spacer(1, 8))
 
-    story.append(Paragraph("Resumo de Machine Learning", styles["Heading2"]))
+    story.append(pdf_paragraph("Resumo de Machine Learning", styles["Heading2"]))
     if ml_unsup:
         story.append(
-            Paragraph(
+            pdf_paragraph(
                 f"Sem alvo: k={ml_unsup['best_k']}, silhouette={ml_unsup['silhouette']:.3f}, anomalias={ml_unsup['anomalias']} (taxa={ml_unsup['contamination']:.2f}).",
                 styles["Normal"],
             )
         )
     else:
-        story.append(Paragraph("Sem resultado de ML sem alvo.", styles["Normal"]))
+        story.append(pdf_paragraph("Sem resultado de ML sem alvo.", styles["Normal"]))
     if ml_sup:
         if ml_sup["problem_type"] == "classification":
             story.append(
-                Paragraph(
+                pdf_paragraph(
                     f"Com alvo ({ml_sup['target_col']}) usando {ml_sup.get('model_choice', 'modelo preditivo')}: CV Acuracia={ml_sup['cv_accuracy']:.3f}, CV F1={ml_sup['cv_f1']:.3f}, Holdout Acuracia={ml_sup['holdout_accuracy']:.3f}.",
                     styles["Normal"],
                 )
             )
         else:
             story.append(
-                Paragraph(
+                pdf_paragraph(
                     f"Com alvo ({ml_sup['target_col']}) usando {ml_sup.get('model_choice', 'modelo preditivo')}: CV R2={ml_sup['cv_r2']:.3f}, CV RMSE={ml_sup['cv_rmse']:.3f}, Holdout R2={ml_sup['holdout_r2']:.3f}.",
                     styles["Normal"],
                 )
             )
     else:
-        story.append(Paragraph("Sem resultado supervisionado.", styles["Normal"]))
+        story.append(pdf_paragraph("Sem resultado supervisionado.", styles["Normal"]))
 
     doc.build(story)
     buffer.seek(0)
@@ -3222,6 +3499,9 @@ def main() -> None:
                         ml_sup=ml_sup,
                         version=version,
                         dashboard_bundle=dashboard_bundle,
+                        treatment_report=treatment_report,
+                        active_filters=active_filters,
+                        area=area,
                     )
                     st.session_state.export_cache[export_key] = {
                         "excel_bytes": excel_bytes,
