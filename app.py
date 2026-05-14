@@ -1958,7 +1958,7 @@ def render_management_dashboard(
         st.dataframe(kpi_df, use_container_width=True)
 
     st.markdown("**Explorador visual interativo**")
-    controls = st.columns(4)
+    controls = st.columns([1.2, 1, 1.2, 1.2, 1])
     cat_col = (
         controls[0].selectbox(
             "Dimensao categórica",
@@ -1980,41 +1980,36 @@ def render_management_dashboard(
     )
     dist_col = (
         controls[3].selectbox(
-            "Distribuicao numerica",
+            "Metrica numerica principal",
             options=metric_numeric,
-            key=f"{key_prefix}_dist_num",
+            key=f"{key_prefix}_primary_metric",
         )
         if metric_numeric
         else None
+    )
+    agg_mode = (
+        controls[4].selectbox(
+            "Agregacao",
+            options=["Soma", "Media", "Mediana", "Contagem"],
+            key=f"{key_prefix}_primary_metric_agg",
+        )
+        if metric_numeric
+        else "Contagem"
     )
 
     if cat_col:
         dist = dashboard_df[cat_col].fillna("NULO").astype(str).value_counts().head(top_n).reset_index()
         dist.columns = [cat_col, "quantidade"]
         left, right = st.columns(2)
+        st.caption("A pizza mostra participacao por quantidade. A barra usa a metrica principal e a agregacao selecionadas.")
         left.plotly_chart(
             px.pie(dist, names=cat_col, values="quantidade", title=f"Participacao por {cat_col}"),
             use_container_width=True,
             key=f"{key_prefix}_pie_{cat_col}",
         )
-        right.plotly_chart(
-            px.bar(dist, x=cat_col, y="quantidade", text="quantidade", title=f"Top {top_n} categorias - {cat_col}"),
-            use_container_width=True,
-            key=f"{key_prefix}_bar_top_{cat_col}",
-        )
 
-        if metric_numeric:
-            mix1, mix2 = st.columns(2)
-            metric_col = mix1.selectbox(
-                "Metrica para comparativo por categoria",
-                options=metric_numeric,
-                key=f"{key_prefix}_metric_by_cat",
-            )
-            agg_mode = mix2.selectbox(
-                "Agregacao da metrica",
-                options=["Soma", "Media", "Mediana", "Contagem"],
-                key=f"{key_prefix}_agg_metric_by_cat",
-            )
+        if metric_numeric and dist_col:
+            metric_col = dist_col
             grp = dashboard_df[[cat_col, metric_col]].dropna(subset=[cat_col]).copy()
             grp[cat_col] = grp[cat_col].astype(str)
             value_col = metric_col
@@ -2029,25 +2024,16 @@ def render_management_dashboard(
                 out = grp.groupby(cat_col, as_index=False)[metric_col].sum()
             out = out.sort_values(value_col, ascending=False).head(top_n)
             title = f"Contagem de registros por {cat_col}" if agg_mode == "Contagem" else f"{agg_mode} de {metric_col} por {cat_col}"
-            st.plotly_chart(
+            right.plotly_chart(
                 px.bar(out, x=cat_col, y=value_col, text=value_col, title=title),
                 use_container_width=True,
-                key=f"{key_prefix}_metric_by_cat_{cat_col}_{value_col}_{agg_mode}",
+                key=f"{key_prefix}_metric_top_{cat_col}_{value_col}_{agg_mode}",
             )
-        elif volume_col:
-            grp = (
-                dashboard_df[[cat_col, volume_col]]
-                .dropna(subset=[cat_col])
-                .assign(**{cat_col: lambda x: x[cat_col].astype(str)})
-                .groupby(cat_col, as_index=False)[volume_col]
-                .nunique()
-                .sort_values(volume_col, ascending=False)
-                .head(top_n)
-            )
-            st.plotly_chart(
-                px.bar(grp, x=cat_col, y=volume_col, text=volume_col, title=f"Quantidade de IDs unicos por {cat_col}"),
+        else:
+            right.plotly_chart(
+                px.bar(dist, x=cat_col, y="quantidade", text="quantidade", title=f"Top {top_n} categorias - {cat_col}"),
                 use_container_width=True,
-                key=f"{key_prefix}_ids_by_cat_{cat_col}_{volume_col}",
+                key=f"{key_prefix}_bar_top_{cat_col}",
             )
 
     if date_col:
