@@ -41,6 +41,7 @@ SUPPORTED_TYPES = ["xlsx", "xls", "xlsm", "xlsb", "ods", "csv", "tsv", "txt"]
 MAX_ANALYSIS_ROWS = 120000
 MAX_ML_ROWS = 30000
 MAX_EXPORT_ROWS = 20000
+MAX_ML_CATEGORICAL_LEVELS = 80
 AUTH_SESSION_TIMEOUT_MINUTES = 30
 AUTH_MAX_ATTEMPTS = 5
 AUTH_LOCK_MINUTES = 10
@@ -48,6 +49,8 @@ DEFAULT_OUTLIER_IQR_MULTIPLIER = 1.5
 DEFAULT_MAX_OUTLIER_DROP_PCT = 0.20
 DEFAULT_MIN_ROWS_AFTER_TREATMENT = 40
 CREATOR_SIGNATURE = "Walace.gorino"
+ML_MISSING_CATEGORY = "__NULO__"
+ML_OTHER_CATEGORY = "__OUTROS__"
 
 ROLE_PERMISSIONS = {
     "admin": {"ml": True, "export": True, "rules": True},
@@ -2263,6 +2266,45 @@ def detect_leakage(x: pd.DataFrame, y: pd.Series, target_col: str) -> List[dict]
     return dedup
 
 
+def sanitize_ml_features(x: pd.DataFrame) -> Tuple[pd.DataFrame, List[str], List[str], List[dict]]:
+    clean = x.copy().dropna(axis=1, how="all")
+    warnings = []
+    num = clean.select_dtypes(include=np.number).columns.tolist()
+    cat = [c for c in clean.columns if c not in num]
+
+    for col in cat:
+        raw = clean[col]
+        if pd.api.types.is_datetime64_any_dtype(raw):
+            values = pd.to_datetime(raw, errors="coerce").dt.strftime("%Y-%m-%d")
+        else:
+            values = raw.astype("object")
+        values = values.where(pd.notna(values), ML_MISSING_CATEGORY).astype(str)
+        values = values.replace(
+            {
+                "nan": ML_MISSING_CATEGORY,
+                "NaN": ML_MISSING_CATEGORY,
+                "NaT": ML_MISSING_CATEGORY,
+                "None": ML_MISSING_CATEGORY,
+                "<NA>": ML_MISSING_CATEGORY,
+            }
+        )
+        unique_count = int(pd.Series(values).nunique(dropna=False))
+        if unique_count > MAX_ML_CATEGORICAL_LEVELS:
+            top_values = pd.Series(values).value_counts(dropna=False).head(MAX_ML_CATEGORICAL_LEVELS).index
+            values = pd.Series(np.where(pd.Series(values).isin(top_values), values, ML_OTHER_CATEGORY), index=clean.index)
+            warnings.append(
+                {
+                    "coluna": col,
+                    "acao": f"Categorias agrupadas em {ML_OTHER_CATEGORY}",
+                    "categorias_originais": unique_count,
+                    "limite": MAX_ML_CATEGORICAL_LEVELS,
+                }
+            )
+        clean[col] = values
+
+    return clean, num, cat, warnings
+
+
 def run_supervised_ml(
     df: pd.DataFrame,
     target_col: str,
@@ -2298,12 +2340,17 @@ def run_supervised_ml(
         st.error("Todas as features foram removidas por risco de leakage.")
         return None
 
-    num = x.select_dtypes(include=np.number).columns.tolist()
-    cat = [c for c in x.columns if c not in num]
+    x, num, cat, feature_warnings = sanitize_ml_features(x)
+    if feature_warnings:
+        st.info("Algumas colunas categoricas tinham muitos valores unicos e foram agrupadas para estabilizar o modelo.")
+        st.dataframe(pd.DataFrame(feature_warnings), use_container_width=True)
+    if x.shape[1] == 0:
+        st.error("Nao ha features validas para treinar o modelo apos a preparacao dos dados.")
+        return None
     preprocess = ColumnTransformer(
         transformers=[
             ("num", Pipeline(steps=[("imputer", SimpleImputer(strategy="median")), ("scaler", StandardScaler())]), num),
-            ("cat", Pipeline(steps=[("imputer", SimpleImputer(strategy="most_frequent")), ("onehot", OneHotEncoder(handle_unknown="ignore"))]), cat),
+            ("cat", Pipeline(steps=[("onehot", OneHotEncoder(handle_unknown="ignore"))]), cat),
         ],
         remainder="drop",
     )
@@ -2311,22 +2358,41 @@ def run_supervised_ml(
     kind = infer_problem_type(y)
     st.caption(f"Alvo: `{target_col}` | Tipo detectado: `{kind}` | Modelo selecionado: `{model_choice}`")
     if kind == "classification":
+        y = y.where(pd.notna(y), ML_MISSING_CATEGORY).astype(str)
+        class_counts = y.value_counts(dropna=True)
+        rare_classes = class_counts[class_counts < 2].index.tolist()
+        if rare_classes:
+            keep_mask = ~y.isin(rare_classes)
+            x = x.loc[keep_mask]
+            y = y.loc[keep_mask]
+            st.info(
+                f"{len(rare_classes)} classe(s) com apenas 1 registro foram removidas do treino para permitir validacao."
+            )
         if y.nunique(dropna=True) < 2:
             st.warning("Alvo para classificacao precisa ter pelo menos 2 classes.")
             return None
         class_counts = y.value_counts(dropna=True)
         min_count = int(class_counts.min()) if len(class_counts) else 1
-        cv_folds = int(max(2, min(5, min_count)))
-        strat = y if min_count >= 2 and y.nunique(dropna=True) <= 30 else None
+        cv_folds = int(min(5, min_count))
+        if cv_folds < 2:
+            st.warning("Nao ha registros suficientes por classe para validacao cruzada.")
+            return None
+        estimated_test_rows = max(1, int(np.ceil(len(y) * 0.2)))
+        strat = y if min_count >= 2 and y.nunique(dropna=True) <= min(30, estimated_test_rows) else None
         if model_choice == "Regressao Linear / Logistica":
             model = LogisticRegression(max_iter=1000, class_weight="balanced", random_state=SEED)
         else:
             model = RandomForestClassifier(n_estimators=300, random_state=SEED, class_weight="balanced_subsample")
         pipe = Pipeline(steps=[("preprocess", preprocess), ("model", model)])
-        cv = cross_validate(pipe, x, y, cv=cv_folds, scoring={"acc": "accuracy", "f1": "f1_weighted"}, error_score="raise")
-        x_train, x_test, y_train, y_test = train_test_split(x, y, test_size=0.2, random_state=SEED, stratify=strat)
-        pipe.fit(x_train, y_train)
-        pred = pipe.predict(x_test)
+        try:
+            cv = cross_validate(pipe, x, y, cv=cv_folds, scoring={"acc": "accuracy", "f1": "f1_weighted"}, error_score="raise")
+            x_train, x_test, y_train, y_test = train_test_split(x, y, test_size=0.2, random_state=SEED, stratify=strat)
+            pipe.fit(x_train, y_train)
+            pred = pipe.predict(x_test)
+        except Exception as exc:
+            st.error("Nao foi possivel treinar o modelo de classificacao com esta configuracao.")
+            st.caption(f"Detalhe tecnico: {str(exc)[:500]}")
+            return None
         hold_acc = accuracy_score(y_test, pred)
         hold_f1 = f1_score(y_test, pred, average="weighted")
         c1, c2, c3, c4 = st.columns(4)
@@ -2361,17 +2427,29 @@ def run_supervised_ml(
     else:
         model = RandomForestRegressor(n_estimators=300, random_state=SEED)
     pipe = Pipeline(steps=[("preprocess", preprocess), ("model", model)])
-    cv = cross_validate(
-        pipe,
-        x,
-        y,
-        cv=cv_folds,
-        scoring={"r2": "r2", "rmse": "neg_root_mean_squared_error", "mae": "neg_mean_absolute_error"},
-        error_score="raise",
-    )
-    x_train, x_test, y_train, y_test = train_test_split(x, y, test_size=0.2, random_state=SEED)
-    pipe.fit(x_train, y_train)
-    pred = pipe.predict(x_test)
+    try:
+        y = pd.to_numeric(y, errors="coerce")
+        valid_target = y.notna()
+        x = x.loc[valid_target]
+        y = y.loc[valid_target]
+        if len(x) < 30:
+            st.warning("Poucos registros com alvo numerico valido para regressao (minimo recomendado: 30).")
+            return None
+        cv = cross_validate(
+            pipe,
+            x,
+            y,
+            cv=cv_folds,
+            scoring={"r2": "r2", "rmse": "neg_root_mean_squared_error", "mae": "neg_mean_absolute_error"},
+            error_score="raise",
+        )
+        x_train, x_test, y_train, y_test = train_test_split(x, y, test_size=0.2, random_state=SEED)
+        pipe.fit(x_train, y_train)
+        pred = pipe.predict(x_test)
+    except Exception as exc:
+        st.error("Nao foi possivel treinar o modelo de regressao com esta configuracao.")
+        st.caption(f"Detalhe tecnico: {str(exc)[:500]}")
+        return None
     hold_mae = mean_absolute_error(y_test, pred)
     hold_rmse = mean_squared_error(y_test, pred) ** 0.5
     hold_r2 = r2_score(y_test, pred)
