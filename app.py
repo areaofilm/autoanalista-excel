@@ -5,6 +5,7 @@ import io
 import json
 import os
 import re
+import sqlite3
 import unicodedata
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -87,6 +88,7 @@ APP_DIR = Path(__file__).resolve().parent
 APP_DATA_DIR = APP_DIR / "app_data"
 HISTORY_FILE = APP_DATA_DIR / "analysis_history.json"
 RULES_FILE = APP_DATA_DIR / "rules_store.json"
+LOCAL_DB_FILE = APP_DATA_DIR / "autoanalista.db"
 
 st.set_page_config(page_title="AutoAnalista 2026", page_icon="📊", layout="wide")
 
@@ -138,6 +140,161 @@ def ensure_data_storage() -> None:
         HISTORY_FILE.write_text("[]", encoding="utf-8")
     if not RULES_FILE.exists():
         RULES_FILE.write_text("{}", encoding="utf-8")
+
+
+def local_database_installed() -> bool:
+    return LOCAL_DB_FILE.exists()
+
+
+def read_history_json() -> List[dict]:
+    ensure_data_storage()
+    try:
+        data = json.loads(HISTORY_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def write_history_json(entries: List[dict]) -> None:
+    ensure_data_storage()
+    HISTORY_FILE.write_text(json.dumps(entries, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def connect_local_database() -> sqlite3.Connection:
+    ensure_data_storage()
+    conn = sqlite3.connect(LOCAL_DB_FILE)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_local_database(migrate_json: bool = True) -> int:
+    conn = connect_local_database()
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS analysis_history (
+                id TEXT PRIMARY KEY,
+                timestamp TEXT NOT NULL,
+                user TEXT,
+                role TEXT,
+                file_name TEXT,
+                sheet_name TEXT,
+                rows INTEGER,
+                cols INTEGER,
+                quality_score REAL,
+                version INTEGER
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS app_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+            """
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO app_meta (key, value) VALUES (?, ?)",
+            ("schema_version", "1"),
+        )
+        inserted = 0
+        if migrate_json:
+            for item in read_history_json():
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO analysis_history
+                    (id, timestamp, user, role, file_name, sheet_name, rows, cols, quality_score, version)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(item.get("id") or hash_text(json.dumps(item, sort_keys=True, default=str))),
+                        str(item.get("timestamp", "")),
+                        str(item.get("user", "")),
+                        str(item.get("role", "")),
+                        str(item.get("file_name", "")),
+                        str(item.get("sheet_name", "")),
+                        int(item.get("rows", 0) or 0),
+                        int(item.get("cols", 0) or 0),
+                        float(item.get("quality_score", 0.0) or 0.0),
+                        int(item.get("version", 1) or 1),
+                    ),
+                )
+                inserted += 1
+        conn.commit()
+        return inserted
+    finally:
+        conn.close()
+
+
+def load_history_from_db() -> List[dict]:
+    init_local_database(migrate_json=False)
+    conn = connect_local_database()
+    try:
+        rows = conn.execute(
+            """
+            SELECT id, timestamp, user, role, file_name, sheet_name, rows, cols, quality_score, version
+            FROM analysis_history
+            ORDER BY timestamp ASC
+            """
+        ).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()
+
+
+def save_history_to_db(entries: List[dict]) -> None:
+    init_local_database(migrate_json=False)
+    conn = connect_local_database()
+    try:
+        conn.execute("DELETE FROM analysis_history")
+        conn.executemany(
+            """
+            INSERT OR REPLACE INTO analysis_history
+            (id, timestamp, user, role, file_name, sheet_name, rows, cols, quality_score, version)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    str(item.get("id") or hash_text(json.dumps(item, sort_keys=True, default=str))),
+                    str(item.get("timestamp", "")),
+                    str(item.get("user", "")),
+                    str(item.get("role", "")),
+                    str(item.get("file_name", "")),
+                    str(item.get("sheet_name", "")),
+                    int(item.get("rows", 0) or 0),
+                    int(item.get("cols", 0) or 0),
+                    float(item.get("quality_score", 0.0) or 0.0),
+                    int(item.get("version", 1) or 1),
+                )
+                for item in entries
+            ],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def clear_analysis_history() -> None:
+    write_history_json([])
+    if local_database_installed():
+        init_local_database(migrate_json=False)
+        conn = connect_local_database()
+        try:
+            conn.execute("DELETE FROM analysis_history")
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def database_status_label() -> str:
+    if not local_database_installed():
+        return "Nao instalado"
+    try:
+        total = len(load_history_from_db())
+        return f"Instalado ({total} registros)"
+    except Exception:
+        return "Instalado com pendencia de inicializacao"
 
 
 def load_rules_store() -> dict:
@@ -264,17 +421,18 @@ def normalize_rules_for_columns(rules: List[dict], columns: List[str]) -> List[d
 
 
 def load_history() -> List[dict]:
-    ensure_data_storage()
-    try:
-        data = json.loads(HISTORY_FILE.read_text(encoding="utf-8"))
-        return data if isinstance(data, list) else []
-    except Exception:
-        return []
+    if local_database_installed():
+        try:
+            return load_history_from_db()
+        except Exception:
+            return read_history_json()
+    return read_history_json()
 
 
 def save_history(entries: List[dict]) -> None:
-    ensure_data_storage()
-    HISTORY_FILE.write_text(json.dumps(entries, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_history_json(entries)
+    if local_database_installed():
+        save_history_to_db(entries)
 
 
 def next_report_version(history: List[dict], file_name: str, sheet_name: str) -> int:
@@ -336,6 +494,34 @@ def apply_theme(theme_mode: str) -> None:
             """,
             unsafe_allow_html=True,
         )
+
+
+def render_database_controls(role: str) -> None:
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("Banco local SQLite")
+    st.sidebar.caption(f"Status: {database_status_label()}")
+    st.sidebar.caption(f"Arquivo local: `{LOCAL_DB_FILE.name}` dentro da pasta `app_data`.")
+
+    if st.sidebar.button("Instalar/Inicializar banco local", use_container_width=True, key="install_local_sqlite"):
+        migrated = init_local_database(migrate_json=True)
+        st.sidebar.success(f"Banco SQLite pronto. Historico migrado: {migrated} registro(s).")
+
+    if role == "admin":
+        confirm_clear = st.sidebar.checkbox("Confirmar limpeza do historico", key="confirm_clear_history")
+        if st.sidebar.button(
+            "Limpar historico de analises",
+            use_container_width=True,
+            key="clear_analysis_history",
+            disabled=not confirm_clear,
+        ):
+            clear_analysis_history()
+            st.session_state.analysis_ready = False
+            st.session_state.analysis_bundle = None
+            st.session_state.analysis_key = None
+            st.session_state.export_cache = {}
+            st.sidebar.success("Historico de analises limpo.")
+    else:
+        st.sidebar.caption("Limpeza disponivel apenas para perfil admin.")
 
 
 def login_panel() -> Optional[dict]:
@@ -3035,6 +3221,7 @@ def main() -> None:
         index=0,
         key="business_area_selector",
     )
+    render_database_controls(role)
 
     st.title("AutoAnalista de Dados 2026")
     st.caption("Analista profissional com qualidade, insights executivos, ML explicavel e governanca de historico.")
@@ -3539,6 +3726,29 @@ def main() -> None:
             )
         else:
             st.info("Perfil viewer sem permissao de exportacao.")
+
+        st.markdown("**Banco de dados local**")
+        db_c1, db_c2, db_c3 = st.columns([1.2, 1, 1])
+        db_c1.info(f"SQLite: {database_status_label()}")
+        if db_c2.button("Instalar/Inicializar SQLite", use_container_width=True, key=f"install_sqlite_tab_{analysis_key}"):
+            migrated = init_local_database(migrate_json=True)
+            st.success(f"Banco SQLite pronto. Historico migrado: {migrated} registro(s).")
+        if role == "admin":
+            clear_tab_confirm = db_c3.checkbox("Confirmar limpeza", key=f"confirm_clear_history_tab_{analysis_key}")
+            if st.button(
+                "Limpar historico de analises",
+                use_container_width=True,
+                key=f"clear_history_tab_{analysis_key}",
+                disabled=not clear_tab_confirm,
+            ):
+                clear_analysis_history()
+                st.session_state.analysis_ready = False
+                st.session_state.analysis_bundle = None
+                st.session_state.analysis_key = None
+                st.session_state.export_cache = {}
+                st.success("Historico de analises limpo.")
+        else:
+            db_c3.caption("Limpeza apenas para admin.")
 
         st.markdown("**Historico de analises**")
         hist_df = pd.DataFrame(load_history())
