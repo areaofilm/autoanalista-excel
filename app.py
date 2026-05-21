@@ -90,15 +90,28 @@ HISTORY_FILE = APP_DATA_DIR / "analysis_history.json"
 RULES_FILE = APP_DATA_DIR / "rules_store.json"
 LOCAL_DB_FILE = APP_DATA_DIR / "autoanalista.db"
 
-st.set_page_config(page_title="AutoAnalista 2026", page_icon="📊", layout="wide")
+st.set_page_config(page_title="AutoAnalista 2026", page_icon=":bar_chart:", layout="wide")
 
 
 def hash_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def repair_text_encoding(text: str) -> str:
+    markers = ("\u00c3", "\u00c2", "\u00e2", "\u00f0\u0178", "\ufffd")
+    if not any(marker in text for marker in markers):
+        return text
+    try:
+        candidate = text.encode("latin1").decode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return text
+    marker_count = sum(text.count(marker) for marker in markers)
+    candidate_marker_count = sum(candidate.count(marker) for marker in markers)
+    return candidate if candidate_marker_count < marker_count else text
+
+
 def normalize_token_text(value: object) -> str:
-    text = str(value)
+    text = repair_text_encoding(str(value))
     text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
     text = re.sub(r"[^A-Za-z0-9]+", "_", text.lower()).strip("_")
     return re.sub(r"_+", "_", text)
@@ -107,8 +120,10 @@ def normalize_token_text(value: object) -> str:
 def clean_report_text(value: object, max_len: int = 180) -> str:
     if value is None or (isinstance(value, float) and pd.isna(value)):
         return "-"
-    text = unicodedata.normalize("NFKD", str(value)).encode("ascii", "ignore").decode("ascii")
+    text = repair_text_encoding(str(value))
+    text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
     text = re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", text)
+    text = re.sub(r"^[^A-Za-z0-9_]+", "", text)
     text = re.sub(r"\s+", " ", text).strip()
     if not text:
         text = "-"
@@ -600,7 +615,19 @@ def login_panel() -> Optional[dict]:
 
 def sanitize_columns(df: pd.DataFrame) -> pd.DataFrame:
     clean = df.copy()
-    clean.columns = [str(col).strip() if str(col).strip() else f"coluna_{i}" for i, col in enumerate(clean.columns)]
+    sanitized = []
+    seen: Dict[str, int] = {}
+    for i, col in enumerate(clean.columns):
+        name = clean_report_text(col, 80)
+        if name == "-":
+            name = f"coluna_{i}"
+        base = name
+        count = seen.get(base, 0)
+        if count:
+            name = f"{base}_{count + 1}"
+        seen[base] = count + 1
+        sanitized.append(name)
+    clean.columns = sanitized
     return clean
 
 
@@ -1191,6 +1218,8 @@ def safe_resample_series(series: pd.Series, freq: str, agg_mode: str) -> pd.Seri
             rs = series.resample(cand)
             if agg_mode == "mean":
                 return rs.mean()
+            if agg_mode == "median":
+                return rs.median()
             if agg_mode == "count":
                 return rs.count()
             if agg_mode == "nunique":
@@ -1362,9 +1391,22 @@ def generate_professional_insights(
 def build_action_plan(area: str, quality_report: dict, issue_catalog: pd.DataFrame) -> List[str]:
     action_df = build_structured_action_plan(area, quality_report, issue_catalog)
     return [
-        f"{row['prioridade']} | Impacto: {row['impacto']} | Acao: {row['acao']} | Prazo: {row['prazo']}"
+        f"{row['prioridade']} | Problema: {row.get('problema', row.get('foco', '-'))} | "
+        f"Impacto: {row['impacto']} | Acao: {row['acao']} | "
+        f"Responsavel: {row.get('responsavel', 'Dono do dado')} | Prazo: {row['prazo']}"
         for _, row in action_df.head(8).iterrows()
     ]
+
+
+def suggested_action_owner(category: str, area: str) -> str:
+    category_key = normalize_token_text(category)
+    if category_key in ["completude", "unicidade", "consistencia"]:
+        return "Dono do dado + Dados"
+    if category_key in ["validade", "regras"]:
+        return "Area de negocio + Qualidade"
+    if area and area != "Geral":
+        return f"Gestor de {area}"
+    return "Governanca de dados"
 
 
 def build_structured_action_plan(area: str, quality_report: dict, issue_catalog: pd.DataFrame) -> pd.DataFrame:
@@ -1383,9 +1425,11 @@ def build_structured_action_plan(area: str, quality_report: dict, issue_catalog:
             rows.append(
                 {
                     "prioridade": pri,
+                    "problema": f"{issue} - {column}",
                     "foco": f"{issue} - {column}",
                     "impacto": f"{affected:,} registros afetados{pct_txt}".replace(",", "."),
                     "acao": clean_report_text(row.get("suggestion", "Corrigir a causa raiz na origem dos dados."), 140),
+                    "responsavel": suggested_action_owner(str(row.get("category", "")), area),
                     "prazo": "0-7 dias" if pri in ["P0", "P1"] else "8-30 dias",
                 }
             )
@@ -1398,15 +1442,27 @@ def build_structured_action_plan(area: str, quality_report: dict, issue_catalog:
         "RH": ("Cadastro de pessoas", "Evita inconsistencias em headcount e movimentacoes.", "Padronizar campos obrigatorios e datas de admissao/desligamento."),
     }
     foco, impacto, acao = area_actions.get(area, area_actions["Geral"])
-    rows.append({"prioridade": "P2", "foco": foco, "impacto": impacto, "acao": acao, "prazo": "8-30 dias"})
+    rows.append(
+        {
+            "prioridade": "P2",
+            "problema": foco,
+            "foco": foco,
+            "impacto": impacto,
+            "acao": acao,
+            "responsavel": suggested_action_owner("governanca", area),
+            "prazo": "8-30 dias",
+        }
+    )
 
     for action in quality_report.get("actions", [])[:3]:
         rows.append(
             {
                 "prioridade": "P2",
+                "problema": "Qualidade de dados",
                 "foco": "Qualidade de dados",
                 "impacto": "Mantem os 5 pilares de qualidade sob controle.",
                 "acao": clean_report_text(action, 140),
+                "responsavel": "Analista de dados + Dono do dado",
                 "prazo": "Recorrente",
             }
         )
@@ -1987,16 +2043,162 @@ def build_dashboard_narrative(
     return notes[:8]
 
 
+def build_numeric_distribution_table(df: pd.DataFrame, metric_numeric: List[str], preferred_metric: Optional[str] = None) -> pd.DataFrame:
+    if not metric_numeric or df.empty:
+        return pd.DataFrame()
+    if preferred_metric in metric_numeric:
+        dist_col = preferred_metric
+    else:
+        ranked = sorted(
+            metric_numeric,
+            key=lambda c: (
+                df[c].notna().sum(),
+                df[c].var(skipna=True) if pd.notna(df[c].var(skipna=True)) else -1,
+            ),
+            reverse=True,
+        )
+        dist_col = ranked[0] if ranked else None
+    if not dist_col:
+        return pd.DataFrame()
+    series = pd.to_numeric(df[dist_col], errors="coerce").dropna()
+    if len(series) < 3:
+        return pd.DataFrame()
+
+    if series.nunique(dropna=True) <= 12:
+        counts = series.value_counts().sort_index()
+        rows = [
+            {
+                "coluna": dist_col,
+                "faixa": clean_report_text(idx, 40),
+                "quantidade": int(value),
+                "participacao_pct": round(float(value) / max(len(series), 1) * 100.0, 2),
+            }
+            for idx, value in counts.items()
+        ]
+        return pd.DataFrame(rows).head(12)
+
+    bin_count = min(12, max(4, int(np.sqrt(len(series)))))
+    counts, edges = np.histogram(series, bins=bin_count)
+    rows = []
+    for i, count in enumerate(counts):
+        rows.append(
+            {
+                "coluna": dist_col,
+                "faixa": f"{edges[i]:.2f} ate {edges[i + 1]:.2f}",
+                "quantidade": int(count),
+                "participacao_pct": round(float(count) / max(len(series), 1) * 100.0, 2),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def build_analytic_reading(
+    df: pd.DataFrame,
+    groups: dict[str, List[str]],
+    quality_report: dict,
+    issue_catalog: pd.DataFrame,
+    top_categories_df: pd.DataFrame,
+    numeric_distribution_df: pd.DataFrame,
+    active_filters: Optional[List[str]] = None,
+) -> List[str]:
+    readings: List[str] = []
+    if active_filters:
+        readings.append(
+            "A leitura analitica abaixo considera os filtros ativos; portanto, os numeros representam o recorte selecionado no dashboard."
+        )
+
+    if len(top_categories_df) > 0:
+        top = top_categories_df.iloc[0]
+        col = clean_report_text(top.get("coluna_categoria", "categoria"), 80)
+        cat = clean_report_text(top.get("categoria", "-"), 80)
+        share = float(top.get("participacao_pct", 0.0) or 0.0)
+        if share >= 60:
+            readings.append(
+                f"A concentracao em `{cat}` na coluna `{col}` ({share:.1f}%) sugere dependencia operacional forte e deve ser monitorada como risco de gargalo."
+            )
+        elif share >= 30:
+            readings.append(
+                f"A categoria `{cat}` lidera a coluna `{col}` com {share:.1f}% dos registros, indicando prioridade natural para investigacao gerencial."
+            )
+        else:
+            readings.append(
+                f"A distribuicao de `{col}` esta mais pulverizada; a gestao deve comparar as principais categorias antes de escolher uma unica causa raiz."
+            )
+
+    missing_by_col = (df.isna().mean() * 100).sort_values(ascending=False) if len(df) > 0 else pd.Series(dtype=float)
+    causal_cols = [
+        col
+        for col, pct in missing_by_col.items()
+        if pct >= 80 and any(tok in normalize_token_text(col).split("_") for tok in ["motivo", "causa", "justificativa", "reason"])
+    ]
+    if causal_cols:
+        readings.append(
+            f"A ausencia elevada da coluna `{causal_cols[0]}` reduz a capacidade de analise causal e limita a explicacao do porque dos eventos."
+        )
+    elif len(missing_by_col) > 0 and float(missing_by_col.iloc[0]) >= 30:
+        readings.append(
+            f"A coluna `{missing_by_col.index[0]}` tem {float(missing_by_col.iloc[0]):.1f}% de ausencia, o que reduz confiabilidade em filtros, segmentacoes e modelos."
+        )
+
+    if float(quality_report.get("outlier_ratio", 0.0)) >= 0.05:
+        readings.append(
+            "A presenca relevante de outliers indica que parte dos registros pode representar erro de entrada ou eventos excepcionais; a decisao de excluir deve ser validada com o negocio."
+        )
+
+    if len(issue_catalog) > 0:
+        top_risk = issue_catalog.sort_values(["priority_rank", "affected_rows"], ascending=[True, False]).iloc[0]
+        readings.append(
+            f"O risco mais urgente e `{top_risk['issue']}` em `{top_risk['column']}`, afetando {int(top_risk['affected_rows'])} registro(s)."
+        )
+
+    strongest = strongest_correlations(df, top_n=1)
+    if len(strongest) > 0:
+        row = strongest.iloc[0]
+        readings.append(
+            f"A correlacao entre `{row['variavel_1']}` e `{row['variavel_2']}` deve ser tratada como sinal analitico, nao como causalidade automatica."
+        )
+
+    if len(numeric_distribution_df) > 0:
+        dist_col = str(numeric_distribution_df["coluna"].iloc[0])
+        peak = numeric_distribution_df.sort_values("quantidade", ascending=False).iloc[0]
+        readings.append(
+            f"A distribuicao numerica de `{dist_col}` concentra mais registros na faixa `{peak['faixa']}`, util para calibrar metas, faixas de alerta e excecoes."
+        )
+
+    if not groups.get("datetime"):
+        readings.append(
+            "A ausencia de uma coluna temporal limita analises de tendencia, sazonalidade e comparacao periodo contra periodo."
+        )
+
+    unique_readings = []
+    seen = set()
+    for item in readings:
+        key = clean_report_text(item, 220)
+        if key not in seen:
+            unique_readings.append(item)
+            seen.add(key)
+    return unique_readings[:8]
+
+
 def build_dashboard_export_bundle(
     df: pd.DataFrame,
     groups: dict[str, List[str]],
     quality_report: dict,
     issue_catalog: pd.DataFrame,
     kpis: List[dict],
+    active_filters: Optional[List[str]] = None,
+    dashboard_config: Optional[dict] = None,
 ) -> dict:
     metric_numeric, id_like_cols = select_numeric_metric_columns(df, groups)
     volume_col = pick_volume_id_column(df, id_like_cols)
-    date_col = max(groups["datetime"], key=lambda c: df[c].notna().sum()) if groups["datetime"] else None
+    dashboard_config = dashboard_config or {}
+    configured_date = dashboard_config.get("date_col")
+    date_col = configured_date if configured_date in groups["datetime"] else (max(groups["datetime"], key=lambda c: df[c].notna().sum()) if groups["datetime"] else None)
+    configured_cat = dashboard_config.get("cat_col")
+    configured_metric = dashboard_config.get("dist_col")
+    top_n = int(dashboard_config.get("top_n", 15) or 15)
+    top_n = min(25, max(5, top_n))
+    active_filters = active_filters or []
 
     summary_rows = [
         {"metrica": "linhas_analisadas", "valor": int(len(df))},
@@ -2015,10 +2217,11 @@ def build_dashboard_export_bundle(
         quality_report,
         issue_catalog,
         kpis,
-        active_filters=[],
+        active_filters=active_filters,
         volume_col=volume_col,
     )
     narrative_df = pd.DataFrame({"analise": narrative})
+    filters_df = pd.DataFrame({"filtro": active_filters}) if active_filters else pd.DataFrame({"filtro": ["Nenhum filtro ativo no dashboard."]})
 
     kpi_df = pd.DataFrame(
         [
@@ -2035,15 +2238,15 @@ def build_dashboard_export_bundle(
     top_categories_df = pd.DataFrame()
     metric_by_category_df = pd.DataFrame()
     if groups["categorical"]:
-        cat_col = max(groups["categorical"], key=lambda c: df[c].notna().sum())
-        dist = df[cat_col].fillna("NULO").astype(str).value_counts().head(15).reset_index()
+        cat_col = configured_cat if configured_cat in groups["categorical"] else max(groups["categorical"], key=lambda c: df[c].notna().sum())
+        dist = df[cat_col].fillna("NULO").astype(str).value_counts().head(top_n).reset_index()
         dist.columns = ["categoria", "quantidade"]
         dist["coluna_categoria"] = cat_col
         dist["participacao_pct"] = (dist["quantidade"] / max(len(df), 1) * 100.0).round(2)
         top_categories_df = dist[["coluna_categoria", "categoria", "quantidade", "participacao_pct"]]
 
         if metric_numeric:
-            metric_col = max(metric_numeric, key=lambda c: df[c].notna().sum())
+            metric_col = configured_metric if configured_metric in metric_numeric else max(metric_numeric, key=lambda c: df[c].notna().sum())
             grp = (
                 df[[cat_col, metric_col]]
                 .dropna(subset=[cat_col, metric_col])
@@ -2051,7 +2254,7 @@ def build_dashboard_export_bundle(
                 .groupby(cat_col, as_index=False)[metric_col]
                 .sum()
                 .sort_values(metric_col, ascending=False)
-                .head(15)
+                .head(top_n)
             )
             grp["coluna_categoria"] = cat_col
             grp["coluna_metrica"] = metric_col
@@ -2065,7 +2268,7 @@ def build_dashboard_export_bundle(
                 .groupby(cat_col, as_index=False)[volume_col]
                 .nunique()
                 .sort_values(volume_col, ascending=False)
-                .head(15)
+                .head(top_n)
             )
             grp["coluna_categoria"] = cat_col
             grp["coluna_metrica"] = volume_col
@@ -2084,25 +2287,46 @@ def build_dashboard_export_bundle(
             base = time_df.set_index(date_col)
 
             if volume_col:
-                trend = base[volume_col].resample(freq).nunique().reset_index(name="valor")
+                trend_series = safe_resample_series(base[volume_col], freq, "nunique")
+                trend = trend_series.reset_index(name="valor")
                 trend_label = f"IDs unicos por {freq_label} ({volume_col})"
             elif metric_numeric:
                 metric_col = max(metric_numeric, key=lambda c: time_df[c].notna().sum())
-                trend = base[metric_col].resample(freq).sum().reset_index(name="valor")
+                trend_series = safe_resample_series(base[metric_col], freq, "sum")
+                trend = trend_series.reset_index(name="valor")
                 trend_label = f"Soma de {metric_col} por {freq_label}"
             else:
-                trend = base.resample(freq).size().reset_index(name="valor")
+                trend_series = safe_resample_series(pd.Series(1, index=base.index), freq, "count")
+                trend = trend_series.reset_index(name="valor")
                 trend_label = f"Volume de linhas por {freq_label}"
 
+            if date_col not in trend.columns:
+                trend = trend.rename(columns={trend.columns[0]: date_col})
             trend["indicador"] = trend_label
             trend_df = trend[[date_col, "indicador", "valor"]]
+
+    distribution_metrics = ([configured_metric] if configured_metric in metric_numeric else []) + [c for c in metric_numeric if c != configured_metric]
+    numeric_distribution_df = build_numeric_distribution_table(df, distribution_metrics, preferred_metric=configured_metric)
+    analytic_reading = build_analytic_reading(
+        df,
+        groups,
+        quality_report,
+        issue_catalog,
+        top_categories_df,
+        numeric_distribution_df,
+        active_filters=active_filters,
+    )
+    analytic_reading_df = pd.DataFrame({"leitura_analitica": analytic_reading})
 
     return {
         "summary_df": summary_df,
         "narrative_df": narrative_df,
+        "analytic_reading_df": analytic_reading_df,
+        "filters_df": filters_df,
         "kpi_df": kpi_df,
         "top_categories_df": top_categories_df,
         "metric_by_category_df": metric_by_category_df,
+        "numeric_distribution_df": numeric_distribution_df,
         "trend_df": trend_df,
         "trend_label": trend_label,
         "volume_col": volume_col,
@@ -2180,6 +2404,8 @@ def render_management_dashboard(
     st.subheader("Dashboard Gerencial")
 
     dashboard_df, dashboard_filters = apply_dashboard_filters(df, groups, key_prefix=key_prefix)
+    st.session_state[f"{key_prefix}_active_filters"] = dashboard_filters
+    st.session_state[f"{key_prefix}_filtered_df"] = dashboard_df.copy()
     if dashboard_df.empty:
         st.warning("Os filtros do dashboard removeram todos os registros. Ajuste os filtros desta aba.")
         return
@@ -2189,6 +2415,7 @@ def render_management_dashboard(
     dash_groups = get_column_groups(dashboard_df)
     metric_numeric, id_like_cols = select_numeric_metric_columns(dashboard_df, dash_groups)
     volume_col = pick_volume_id_column(dashboard_df, id_like_cols)
+    dash_kpis = detect_kpis(dashboard_df, dash_groups) or kpis
 
     critical_or_high = (
         issue_catalog["priority"].astype(str).str.lower().isin(["critical", "high"]).sum()
@@ -2213,14 +2440,14 @@ def render_management_dashboard(
         dash_groups,
         quality_report,
         issue_catalog,
-        kpis,
+        dash_kpis,
         dashboard_filters,
         volume_col,
     )
     for note in dashboard_notes:
         st.markdown(f"- {note}")
 
-    if kpis:
+    if dash_kpis:
         st.markdown("**KPI board executivo**")
         kpi_df = pd.DataFrame(
             [
@@ -2230,7 +2457,7 @@ def render_management_dashboard(
                     "Variacao recente": item["delta_text"] if item["delta_text"] else "-",
                     "Alerta": item["alert"] if item["alert"] else "-",
                 }
-                for item in kpis
+                for item in dash_kpis
             ]
         )
         st.dataframe(kpi_df, use_container_width=True)
@@ -2239,7 +2466,7 @@ def render_management_dashboard(
     controls = st.columns([1.2, 1, 1.2, 1.2, 1])
     cat_col = (
         controls[0].selectbox(
-            "Dimensao categórica",
+            "Dimensao categorica",
             options=dash_groups["categorical"],
             key=f"{key_prefix}_cat_dim",
         )
@@ -2274,6 +2501,13 @@ def render_management_dashboard(
         if metric_numeric
         else "Contagem"
     )
+    st.session_state[f"{key_prefix}_config"] = {
+        "cat_col": cat_col,
+        "top_n": top_n,
+        "date_col": date_col,
+        "dist_col": dist_col,
+        "agg_mode": agg_mode,
+    }
 
     if cat_col:
         dist = dashboard_df[cat_col].fillna("NULO").astype(str).value_counts().head(top_n).reset_index()
@@ -2322,6 +2556,7 @@ def render_management_dashboard(
         t1, t2 = st.columns(2)
         trend_choice = t1.selectbox("Indicador da serie temporal", options=trend_choices, key=f"{key_prefix}_trend_choice")
         metric_agg = t2.selectbox("Agregacao numerica temporal", options=["Soma", "Media", "Mediana", "Contagem"], key=f"{key_prefix}_trend_agg")
+        st.session_state[f"{key_prefix}_config"].update({"trend_choice": trend_choice, "trend_agg": metric_agg})
 
         dt_series = pd.to_datetime(dashboard_df[date_col], errors="coerce", dayfirst=True)
         time_df = dashboard_df.copy()
@@ -2333,23 +2568,25 @@ def render_management_dashboard(
             base = time_df.set_index(date_col)
 
             if trend_choice == "Linhas por periodo":
-                trend = base.resample(freq).size().reset_index(name="valor")
+                trend = safe_resample_series(pd.Series(1, index=base.index), freq, "count").reset_index(name="valor")
                 y_name = "valor"
             elif trend_choice.startswith("IDs unicos"):
-                trend = base[volume_col].resample(freq).nunique().reset_index(name="valor")
+                trend = safe_resample_series(base[volume_col], freq, "nunique").reset_index(name="valor")
                 y_name = "valor"
             else:
                 metric_col = trend_choice.replace("Metrica numerica (", "").replace(")", "")
                 if metric_agg == "Media":
-                    trend = base[metric_col].resample(freq).mean().reset_index(name="valor")
+                    trend = safe_resample_series(base[metric_col], freq, "mean").reset_index(name="valor")
                 elif metric_agg == "Mediana":
-                    trend = base[metric_col].resample(freq).median().reset_index(name="valor")
+                    trend = safe_resample_series(base[metric_col], freq, "median").reset_index(name="valor")
                 elif metric_agg == "Contagem":
-                    trend = base[metric_col].resample(freq).count().reset_index(name="valor")
+                    trend = safe_resample_series(base[metric_col], freq, "count").reset_index(name="valor")
                 else:
-                    trend = base[metric_col].resample(freq).sum().reset_index(name="valor")
+                    trend = safe_resample_series(base[metric_col], freq, "sum").reset_index(name="valor")
                 y_name = "valor"
 
+            if date_col not in trend.columns:
+                trend = trend.rename(columns={trend.columns[0]: date_col})
             chart_left, chart_right = st.columns(2)
             chart_left.plotly_chart(
                 px.line(trend, x=date_col, y=y_name, markers=True, title=f"Tendencia por {freq_label}"),
@@ -2530,6 +2767,31 @@ def detect_leakage(x: pd.DataFrame, y: pd.Series, target_col: str) -> List[dict]
     return dedup
 
 
+def serialize_feature_importance(imp_df: pd.DataFrame, top_n: int = 12) -> List[dict]:
+    if imp_df is None or len(imp_df) == 0:
+        return []
+    out = []
+    for _, row in imp_df.head(top_n).iterrows():
+        out.append({"feature": clean_report_text(row.get("feature", "-"), 90), "importance": float(row.get("importance", 0.0) or 0.0)})
+    return out
+
+
+def ml_reliability_alert(problem_type: str, metrics: dict) -> str:
+    if problem_type == "classification":
+        score = float(metrics.get("holdout_f1", metrics.get("cv_f1", 0.0)) or 0.0)
+        if score >= 0.75:
+            return "Confiabilidade boa para apoio gerencial, mantendo validacao humana antes de decisoes automaticas."
+        if score >= 0.60:
+            return "Confiabilidade moderada: use como sinal de apoio e melhore volume/qualidade dos dados antes de automatizar."
+        return "Confiabilidade baixa: resultado exploratorio, recomendado revisar alvo, features e balanceamento das classes."
+    score = float(metrics.get("holdout_r2", metrics.get("cv_r2", 0.0)) or 0.0)
+    if score >= 0.60:
+        return "Confiabilidade boa para estimativas direcionais, mantendo monitoramento de erro por periodo."
+    if score >= 0.30:
+        return "Confiabilidade moderada: modelo explica parte da variacao, mas ainda requer mais dados ou variaveis explicativas."
+    return "Confiabilidade baixa: modelo tem baixo poder explicativo para previsao operacional neste conjunto de dados."
+
+
 def sanitize_ml_features(x: pd.DataFrame) -> Tuple[pd.DataFrame, List[str], List[str], List[dict]]:
     clean = x.copy().dropna(axis=1, how="all")
     warnings = []
@@ -2674,15 +2936,20 @@ def run_supervised_ml(
             key=f"{key_prefix}_classification_importance",
         )
         st.success("Classificacao treinada com validacao cruzada e explicabilidade.")
-        return {
-            "problem_type": "classification",
-            "target_col": target_col,
-            "model_choice": model_choice,
+        metrics = {
             "cv_accuracy": float(np.mean(cv["test_acc"])),
             "cv_f1": float(np.mean(cv["test_f1"])),
             "holdout_accuracy": float(hold_acc),
             "holdout_f1": float(hold_f1),
+        }
+        return {
+            "problem_type": "classification",
+            "target_col": target_col,
+            "model_choice": model_choice,
+            **metrics,
             "removed_leakage_features": leak_cols,
+            "feature_importance": serialize_feature_importance(imp_df),
+            "model_reliability_alert": ml_reliability_alert("classification", metrics),
         }
 
     cv_folds = 5 if len(x) >= 100 else 3
@@ -2734,17 +3001,22 @@ def run_supervised_ml(
         key=f"{key_prefix}_regression_importance",
     )
     st.success("Regressao treinada com validacao cruzada e explicabilidade.")
-    return {
-        "problem_type": "regression",
-        "target_col": target_col,
-        "model_choice": model_choice,
+    metrics = {
         "cv_r2": float(np.mean(cv["test_r2"])),
         "cv_rmse": float(-np.mean(cv["test_rmse"])),
         "cv_mae": float(-np.mean(cv["test_mae"])),
         "holdout_r2": float(hold_r2),
         "holdout_rmse": float(hold_rmse),
         "holdout_mae": float(hold_mae),
+    }
+    return {
+        "problem_type": "regression",
+        "target_col": target_col,
+        "model_choice": model_choice,
+        **metrics,
         "removed_leakage_features": leak_cols,
+        "feature_importance": serialize_feature_importance(imp_df),
+        "model_reliability_alert": ml_reliability_alert("regression", metrics),
     }
 
 
@@ -2801,7 +3073,9 @@ def generate_excel_export(
         pd.DataFrame({"acao_recomendada": recommendations}).to_excel(writer, sheet_name="recomendacoes", index=False)
         if dashboard_bundle:
             dashboard_bundle.get("summary_df", pd.DataFrame()).to_excel(writer, sheet_name="dash_resumo", index=False)
+            dashboard_bundle.get("filters_df", pd.DataFrame()).to_excel(writer, sheet_name="dash_filtros", index=False)
             dashboard_bundle.get("narrative_df", pd.DataFrame()).to_excel(writer, sheet_name="dash_narrativa", index=False)
+            dashboard_bundle.get("analytic_reading_df", pd.DataFrame()).to_excel(writer, sheet_name="dash_leitura", index=False)
             dashboard_bundle.get("kpi_df", pd.DataFrame()).to_excel(writer, sheet_name="dash_kpis", index=False)
             top_cat_df = dashboard_bundle.get("top_categories_df", pd.DataFrame())
             if len(top_cat_df) > 0:
@@ -2809,6 +3083,9 @@ def generate_excel_export(
             metric_cat_df = dashboard_bundle.get("metric_by_category_df", pd.DataFrame())
             if len(metric_cat_df) > 0:
                 metric_cat_df.to_excel(writer, sheet_name="dash_metrica_categoria", index=False)
+            dist_df = dashboard_bundle.get("numeric_distribution_df", pd.DataFrame())
+            if len(dist_df) > 0:
+                dist_df.to_excel(writer, sheet_name="dash_dist_numerica", index=False)
             trend_df = dashboard_bundle.get("trend_df", pd.DataFrame())
             if len(trend_df) > 0:
                 trend_df.to_excel(writer, sheet_name="dash_tendencia", index=False)
@@ -2948,6 +3225,52 @@ def append_if_chart(story: List[object], chart: Optional[Drawing]) -> None:
         story.append(Spacer(1, 8))
 
 
+def build_executive_sections(
+    insights: List[str],
+    dashboard_bundle: Optional[dict],
+    quality_report: dict,
+    issue_catalog: pd.DataFrame,
+    action_df: pd.DataFrame,
+) -> Dict[str, List[str]]:
+    analytic_df = dashboard_bundle.get("analytic_reading_df", pd.DataFrame()) if dashboard_bundle else pd.DataFrame()
+    analytic_notes = analytic_df["leitura_analitica"].dropna().astype(str).tolist() if len(analytic_df) > 0 else []
+
+    what_happened = (analytic_notes[:2] + insights[:2])[:3]
+    if not what_happened:
+        what_happened = [f"A base foi analisada com score de qualidade {quality_report.get('score', 0.0):.1f}/100."]
+
+    risks: List[str] = []
+    if len(issue_catalog) > 0:
+        for _, row in issue_catalog.sort_values(["priority_rank", "affected_rows"], ascending=[True, False]).head(3).iterrows():
+            risks.append(
+                f"{row['issue']} em {row['column']}: {int(row['affected_rows'])} registro(s) afetado(s)."
+            )
+    if not risks:
+        risks.append("Nao foram encontrados riscos criticos no catalogo automatico, mantendo monitoramento por lote.")
+
+    opportunities: List[str] = []
+    if quality_report.get("score", 0) >= 80:
+        opportunities.append("A qualidade atual permite uso gerencial mais seguro e evolucao para monitoramento recorrente.")
+    else:
+        opportunities.append("A maior oportunidade esta em elevar completude, consistencia e padronizacao antes de automatizar decisoes.")
+    opportunities.extend([note for note in analytic_notes if "concentracao" in normalize_token_text(note) or "distribuicao" in normalize_token_text(note)][:2])
+
+    actions: List[str] = []
+    for _, row in action_df.head(3).iterrows():
+        actions.append(
+            f"{row['prioridade']} - {row['acao']} | Responsavel: {row.get('responsavel', 'Dono do dado')} | Prazo: {row['prazo']}"
+        )
+    if not actions:
+        actions.append("Manter rotina de validacao e acompanhamento de indicadores por periodo.")
+
+    return {
+        "O que aconteceu": what_happened[:3],
+        "Principais riscos": risks[:3],
+        "Principais oportunidades": opportunities[:3],
+        "Acoes recomendadas": actions[:3],
+    }
+
+
 def build_pdf_report(
     *,
     source_name: str,
@@ -2977,6 +3300,8 @@ def build_pdf_report(
     rows_analyzed = summary_map.get("linhas_analisadas", treatment_report.get("rows_after", "-") if treatment_report else "-")
     cols_analyzed = summary_map.get("colunas_analisadas", "-")
     risk_count = summary_map.get("riscos_criticos_altos", 0)
+    active_filters = active_filters or []
+    action_df = build_structured_action_plan(area, quality_report, issue_catalog)
 
     cover = Table(
         [
@@ -3002,6 +3327,9 @@ def build_pdf_report(
     story.append(cover)
     story.append(Spacer(1, 12))
 
+    story.append(pdf_paragraph("Relatorio Executivo", styles["Heading1"]))
+    story.append(Spacer(1, 6))
+
     executive_metrics = [
         ["Indicador", "Resultado"],
         ["Score de qualidade", f"{score:.1f}/100 ({level})"],
@@ -3014,25 +3342,46 @@ def build_pdf_report(
     story.append(pdf_table(executive_metrics, [240, 240], header_color="#0F6E9A", font_size=9))
     story.append(Spacer(1, 10))
 
-    if active_filters:
-        story.append(pdf_paragraph("Filtros aplicados: " + " | ".join(active_filters[:8]), styles["Normal"]))
-        story.append(Spacer(1, 6))
+    filter_text = " | ".join(active_filters[:10]) if active_filters else "Nenhum filtro global ou de dashboard ativo no momento da geracao."
+    story.append(pdf_paragraph("Filtros usados no relatorio: " + filter_text, styles["Normal"]))
+    story.append(Spacer(1, 6))
 
     story.append(pdf_paragraph("Resumo executivo", styles["Heading2"]))
-    for i in insights[:8]:
-        story.append(pdf_paragraph(f"- {i}", styles["Normal"]))
+    executive_sections = build_executive_sections(insights, dashboard_bundle, quality_report, issue_catalog, action_df)
+    for section, bullets in executive_sections.items():
+        story.append(pdf_paragraph(section, styles["Heading3"]))
+        for item in bullets:
+            story.append(pdf_paragraph(f"- {item}", styles["Normal"]))
     story.append(Spacer(1, 8))
 
+    if dashboard_bundle:
+        analytic_df = dashboard_bundle.get("analytic_reading_df", pd.DataFrame())
+        if len(analytic_df) > 0:
+            story.append(pdf_paragraph("Leitura Analitica", styles["Heading2"]))
+            for _, row in analytic_df.head(6).iterrows():
+                story.append(pdf_paragraph(f"- {row.get('leitura_analitica', '-')}", styles["Normal"]))
+            story.append(Spacer(1, 8))
+
     story.append(pdf_paragraph("Plano de acao gerencial", styles["Heading2"]))
-    action_df = build_structured_action_plan(area, quality_report, issue_catalog)
-    action_data = [["Prioridade", "Foco", "Impacto", "Acao", "Prazo"]]
+    action_data = [["Prioridade", "Problema", "Impacto", "Acao", "Responsavel", "Prazo"]]
     for _, row in action_df.head(6).iterrows():
-        action_data.append([row["prioridade"], row["foco"], row["impacto"], row["acao"], row["prazo"]])
-    story.append(pdf_table(action_data, [55, 105, 115, 160, 65], header_color="#B45309", font_size=7))
+        action_data.append(
+            [
+                row["prioridade"],
+                row.get("problema", row.get("foco", "-")),
+                row["impacto"],
+                row["acao"],
+                row.get("responsavel", "Dono do dado"),
+                row["prazo"],
+            ]
+        )
+    story.append(pdf_table(action_data, [45, 90, 95, 135, 80, 55], header_color="#B45309", font_size=6))
     story.append(Spacer(1, 8))
 
     story.append(PageBreak())
 
+    story.append(pdf_paragraph("Relatorio Tecnico", styles["Heading1"]))
+    story.append(Spacer(1, 6))
     story.append(pdf_paragraph("Qualidade e Graficos Executivos", styles["Heading2"]))
     quality_data = [["Pilar", "Score"]] + [[k, f"{v:.1f}"] for k, v in quality_report["pillars"].items()]
     story.append(pdf_table(quality_data, [250, 120], header_color="#1F4E79", font_size=9))
@@ -3054,6 +3403,9 @@ def build_pdf_report(
             ["Vazias removidas", treatment_report.get("empty_rows_removed", 0)],
             ["Duplicadas removidas", treatment_report.get("duplicates_removed", 0)],
             ["Outliers removidos", treatment_report.get("outliers_removed", 0)],
+            ["Total removido", treatment_report.get("total_removed", 0)],
+            ["Ausencia antes", f"{float(treatment_report.get('missing_ratio_before', 0.0)) * 100:.2f}%"],
+            ["Ausencia depois", f"{float(treatment_report.get('missing_ratio_after', 0.0)) * 100:.2f}%"],
         ]
         story.append(pdf_paragraph("Tratativa dos dados", styles["Heading3"]))
         story.append(pdf_table(treatment_data, [240, 120], header_color="#334155", font_size=8))
@@ -3091,6 +3443,13 @@ def build_pdf_report(
     if dashboard_bundle:
         story.append(PageBreak())
         story.append(pdf_paragraph("Analise do Dashboard", styles["Heading2"]))
+        filters_df = dashboard_bundle.get("filters_df", pd.DataFrame())
+        if len(filters_df) > 0:
+            story.append(pdf_paragraph("Filtros do Dashboard registrados", styles["Heading3"]))
+            filter_data = [["Filtro"]] + [[row.get("filtro", "-")] for _, row in filters_df.head(10).iterrows()]
+            story.append(pdf_table(filter_data, [460], header_color="#334155", font_size=8))
+            story.append(Spacer(1, 6))
+
         narrative_df = dashboard_bundle.get("narrative_df", pd.DataFrame())
         if len(narrative_df) > 0:
             for _, row in narrative_df.head(8).iterrows():
@@ -3147,6 +3506,25 @@ def build_pdf_report(
                 ),
             )
 
+        numeric_dist_df = dashboard_bundle.get("numeric_distribution_df", pd.DataFrame())
+        if len(numeric_dist_df) > 0:
+            dist_col = str(numeric_dist_df["coluna"].iloc[0]) if "coluna" in numeric_dist_df.columns else "metrica"
+            story.append(pdf_paragraph("Distribuicao numerica", styles["Heading3"]))
+            append_if_chart(
+                story,
+                make_vertical_bar_chart(
+                    numeric_dist_df["faixa"].head(10).tolist(),
+                    numeric_dist_df["quantidade"].head(10).tolist(),
+                    f"Distribuicao de {dist_col}",
+                    color="#4EA3F1",
+                ),
+            )
+            dist_data = [["Faixa", "Quantidade", "Participacao %"]]
+            for _, row in numeric_dist_df.head(8).iterrows():
+                dist_data.append([row.get("faixa", "-"), row.get("quantidade", "-"), f"{float(row.get('participacao_pct', 0.0)):.2f}%"])
+            story.append(pdf_table(dist_data, [210, 100, 120], header_color="#4EA3F1", font_size=8))
+            story.append(Spacer(1, 6))
+
         trend_df = dashboard_bundle.get("trend_df", pd.DataFrame())
         if len(trend_df) > 0:
             story.append(pdf_paragraph("Tendencia temporal extraida", styles["Heading3"]))
@@ -3188,6 +3566,22 @@ def build_pdf_report(
             story.append(
                 pdf_paragraph(
                     f"Com alvo ({ml_sup['target_col']}) usando {ml_sup.get('model_choice', 'modelo preditivo')}: CV R2={ml_sup['cv_r2']:.3f}, CV RMSE={ml_sup['cv_rmse']:.3f}, Holdout R2={ml_sup['holdout_r2']:.3f}.",
+                    styles["Normal"],
+                )
+            )
+        if ml_sup.get("model_reliability_alert"):
+            story.append(pdf_paragraph("Alerta de confiabilidade: " + ml_sup["model_reliability_alert"], styles["Normal"]))
+        feature_importance = ml_sup.get("feature_importance", [])
+        if feature_importance:
+            story.append(pdf_paragraph("Principais variaveis explicativas", styles["Heading3"]))
+            feature_data = [["Variavel", "Importancia"]]
+            for item in feature_importance[:10]:
+                feature_data.append([item.get("feature", "-"), f"{float(item.get('importance', 0.0)):.4f}"])
+            story.append(pdf_table(feature_data, [280, 120], header_color="#0F6E9A", font_size=8))
+        if ml_sup.get("removed_leakage_features"):
+            story.append(
+                pdf_paragraph(
+                    "Colunas removidas por risco de leakage: " + ", ".join(map(str, ml_sup.get("removed_leakage_features", [])[:8])),
                     styles["Normal"],
                 )
             )
@@ -3649,12 +4043,25 @@ def main() -> None:
             build_exports = st.button("Preparar Exportacoes", type="primary", use_container_width=True, key=f"prep_export_{analysis_key}")
             if build_exports:
                 with st.spinner("Gerando pacotes de exportacao..."):
+                    dashboard_key_prefix = f"dash_{analysis_key}"
+                    dashboard_filters_for_report = st.session_state.get(f"{dashboard_key_prefix}_active_filters", [])
+                    dashboard_config_for_report = st.session_state.get(f"{dashboard_key_prefix}_config", {})
+                    dashboard_report_df = st.session_state.get(f"{dashboard_key_prefix}_filtered_df")
+                    if not isinstance(dashboard_report_df, pd.DataFrame) or dashboard_report_df.empty:
+                        dashboard_report_df = analysis_df
+                    dashboard_report_groups = get_column_groups(dashboard_report_df)
+                    dashboard_report_kpis = detect_kpis(dashboard_report_df, dashboard_report_groups)
+                    dashboard_top_corr = strongest_correlations(dashboard_report_df, top_n=10)
+                    report_filters = [f"Global - {item}" for item in active_filters]
+                    report_filters.extend([f"Dashboard - {item}" for item in dashboard_filters_for_report])
                     dashboard_bundle = build_dashboard_export_bundle(
-                        analysis_df,
-                        groups,
+                        dashboard_report_df,
+                        dashboard_report_groups,
                         quality,
                         issue_catalog,
-                        kpis,
+                        dashboard_report_kpis,
+                        active_filters=dashboard_filters_for_report,
+                        dashboard_config=dashboard_config_for_report,
                     )
                     excel_bytes = generate_excel_export(
                         treated_df_export,
@@ -3680,14 +4087,14 @@ def main() -> None:
                         quality_report=quality,
                         insights=insights,
                         recommendations=recommendations,
-                        top_corr=top_corr,
+                        top_corr=dashboard_top_corr if len(dashboard_top_corr) > 0 else top_corr,
                         issue_catalog=issue_catalog,
                         ml_unsup=ml_unsup,
                         ml_sup=ml_sup,
                         version=version,
                         dashboard_bundle=dashboard_bundle,
                         treatment_report=treatment_report,
-                        active_filters=active_filters,
+                        active_filters=report_filters,
                         area=area,
                     )
                     st.session_state.export_cache[export_key] = {
