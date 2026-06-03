@@ -2122,6 +2122,180 @@ def build_numeric_distribution_table(df: pd.DataFrame, metric_numeric: List[str]
     return pd.DataFrame(rows)
 
 
+def apply_analytics_chart_layout(fig, *, title: Optional[str] = None, height: int = 420):
+    if title:
+        fig.update_layout(title=title)
+    fig.update_layout(
+        height=height,
+        margin=dict(l=24, r=24, t=70, b=42),
+        legend_title_text="",
+        hovermode="x unified",
+        font=dict(size=12),
+    )
+    return fig
+
+
+def add_chart_reading(title: str, bullets: List[str]) -> None:
+    clean_bullets = [clean_report_text(item, 260) for item in bullets if item]
+    if not clean_bullets:
+        return
+    with st.container():
+        st.markdown(f"**Leitura do grafico - {title}**")
+        for item in clean_bullets[:4]:
+            st.caption(f"- {item}")
+
+
+def categorical_distribution(df: pd.DataFrame, cat_col: str, top_n: int = 10) -> pd.DataFrame:
+    dist = df[cat_col].fillna("NULO").astype(str).value_counts().head(top_n).reset_index()
+    dist.columns = [cat_col, "quantidade"]
+    total = max(int(len(df)), 1)
+    dist["participacao_pct"] = dist["quantidade"] / total * 100.0
+    dist["acumulado_pct"] = dist["participacao_pct"].cumsum()
+    return dist
+
+
+def category_reading(dist: pd.DataFrame, cat_col: str) -> List[str]:
+    if dist.empty:
+        return []
+    top = dist.iloc[0]
+    top_name = str(top[cat_col])
+    top_share = float(top.get("participacao_pct", 0.0))
+    pareto_count = int((dist["acumulado_pct"] <= 80).sum())
+    pareto_count = max(1, pareto_count)
+    bullets = [
+        f"`{top_name}` lidera `{cat_col}` com {top_share:.1f}% dos registros.",
+        f"As {pareto_count} primeiras categorias concentram aproximadamente {float(dist.iloc[pareto_count - 1]['acumulado_pct']):.1f}% do volume exibido.",
+    ]
+    if top_share >= 60:
+        bullets.append("Ha alta concentracao: vale investigar dependencia, gargalo ou categoria dominante no processo.")
+    elif top_share >= 30:
+        bullets.append("Ha concentracao moderada: priorize as maiores categorias antes de atuar em casos pulverizados.")
+    else:
+        bullets.append("A distribuicao esta pulverizada: a leitura deve considerar varios grupos, nao apenas o primeiro.")
+    return bullets
+
+
+def build_metric_by_category(
+    df: pd.DataFrame,
+    cat_col: str,
+    metric_col: Optional[str],
+    agg_mode: str,
+    top_n: int,
+) -> Tuple[pd.DataFrame, str, str]:
+    base = df[[cat_col] + ([metric_col] if metric_col else [])].dropna(subset=[cat_col]).copy()
+    base[cat_col] = base[cat_col].astype(str)
+    if metric_col and metric_col in base.columns and agg_mode != "Contagem":
+        if agg_mode == "Media":
+            out = base.groupby(cat_col, as_index=False)[metric_col].mean()
+        elif agg_mode == "Mediana":
+            out = base.groupby(cat_col, as_index=False)[metric_col].median()
+        else:
+            out = base.groupby(cat_col, as_index=False)[metric_col].sum()
+        value_col = metric_col
+        title = f"{agg_mode} de {metric_col} por {cat_col}"
+    else:
+        out = base.groupby(cat_col, as_index=False).size().rename(columns={"size": "contagem"})
+        value_col = "contagem"
+        title = f"Contagem de registros por {cat_col}"
+    out = out.sort_values(value_col, ascending=False).head(top_n)
+    return out, value_col, title
+
+
+def metric_category_reading(out: pd.DataFrame, cat_col: str, value_col: str, title: str) -> List[str]:
+    if out.empty:
+        return []
+    total = float(out[value_col].sum()) if value_col in out.columns else 0.0
+    top = out.iloc[0]
+    top_value = float(top[value_col])
+    share = (top_value / total * 100.0) if total else 0.0
+    bullets = [
+        f"O maior grupo e `{top[cat_col]}` com {top_value:,.2f} em `{value_col}`.".replace(",", "."),
+        f"Esse grupo representa {share:.1f}% do total exibido no ranking.",
+    ]
+    if len(out) >= 3:
+        third_value = float(out.iloc[min(2, len(out) - 1)][value_col])
+        if third_value > 0 and top_value / third_value >= 2:
+            bullets.append("O primeiro colocado esta pelo menos 2x acima do terceiro, indicando diferenca relevante de desempenho/volume.")
+    bullets.append(f"Use este ranking para priorizar acao sobre os maiores impactos em `{title}`.")
+    return bullets
+
+
+def add_mean_median_lines(fig, series: pd.Series, axis: str = "x") -> None:
+    clean = pd.to_numeric(series, errors="coerce").dropna()
+    if len(clean) == 0:
+        return
+    mean_v = float(clean.mean())
+    median_v = float(clean.median())
+    if axis == "x":
+        fig.add_vline(x=mean_v, line_dash="dash", line_color="#F97316", annotation_text="media")
+        fig.add_vline(x=median_v, line_dash="dot", line_color="#22C55E", annotation_text="mediana")
+    else:
+        fig.add_hline(y=mean_v, line_dash="dash", line_color="#F97316", annotation_text="media")
+        fig.add_hline(y=median_v, line_dash="dot", line_color="#22C55E", annotation_text="mediana")
+
+
+def numeric_distribution_reading(df: pd.DataFrame, col: str) -> List[str]:
+    s = pd.to_numeric(df[col], errors="coerce").dropna()
+    if len(s) == 0:
+        return []
+    q1, q3 = float(s.quantile(0.25)), float(s.quantile(0.75))
+    mean_v, median_v = float(s.mean()), float(s.median())
+    skew_hint = "acima" if mean_v > median_v else "abaixo"
+    bullets = [
+        f"Media {mean_v:,.2f} e mediana {median_v:,.2f}; media {skew_hint} da mediana sugere assimetria na distribuicao.".replace(",", "."),
+        f"Faixa interquartil: {q1:,.2f} a {q3:,.2f}, onde fica a metade central dos registros.".replace(",", "."),
+    ]
+    outlier_ratio = float(((s < q1 - 1.5 * (q3 - q1)) | (s > q3 + 1.5 * (q3 - q1))).mean()) if q3 > q1 else 0.0
+    if outlier_ratio >= 0.05:
+        bullets.append(f"Outliers potenciais representam {outlier_ratio * 100:.1f}% dos valores; revisar antes de decisoes automaticas.")
+    return bullets
+
+
+def enrich_trend_dataframe(trend: pd.DataFrame, date_col: str, value_col: str = "valor") -> pd.DataFrame:
+    out = trend.copy()
+    out = out.sort_values(date_col)
+    window = min(4, max(2, len(out) // 4))
+    out["media_movel"] = out[value_col].rolling(window=window, min_periods=1).mean()
+    out["variacao_pct"] = out[value_col].pct_change() * 100.0
+    return out
+
+
+def trend_reading(trend: pd.DataFrame, value_col: str = "valor") -> List[str]:
+    if len(trend) < 2 or value_col not in trend.columns:
+        return []
+    first = float(trend[value_col].iloc[0])
+    last = float(trend[value_col].iloc[-1])
+    delta_abs = last - first
+    delta_pct = (delta_abs / abs(first) * 100.0) if abs(first) > 1e-9 else None
+    recent = trend[value_col].tail(min(4, len(trend))).astype(float)
+    direction = "alta" if delta_abs > 0 else "queda" if delta_abs < 0 else "estabilidade"
+    bullets = [f"A serie mostra {direction} entre o primeiro e o ultimo periodo."]
+    if delta_pct is not None:
+        bullets.append(f"Variacao acumulada aproximada: {delta_pct:.1f}%.")
+    if len(recent) >= 3:
+        recent_slope = recent.iloc[-1] - recent.iloc[0]
+        if recent_slope > 0:
+            bullets.append("Nos periodos recentes, a tendencia esta acelerando para cima.")
+        elif recent_slope < 0:
+            bullets.append("Nos periodos recentes, a tendencia esta desacelerando ou caindo.")
+    return bullets
+
+
+def scatter_reading(df: pd.DataFrame, x_col: str, y_col: str) -> List[str]:
+    base = df[[x_col, y_col]].dropna()
+    if len(base) < 10:
+        return []
+    corr = base[x_col].corr(base[y_col])
+    if pd.isna(corr):
+        return []
+    strength = "forte" if abs(float(corr)) >= 0.7 else "moderada" if abs(float(corr)) >= 0.4 else "fraca"
+    direction = "positiva" if corr >= 0 else "negativa"
+    return [
+        f"Correlacao {direction} {strength}: {float(corr):.3f}.",
+        "Use como sinal de associacao; correlacao nao confirma causalidade sem validacao de negocio.",
+    ]
+
+
 def build_analytic_reading(
     df: pd.DataFrame,
     groups: dict[str, List[str]],
@@ -2375,8 +2549,13 @@ def render_auto_charts(df: pd.DataFrame, groups: dict[str, List[str]], top_corr:
             c = st.columns(len(top_nums))
             for i, col in enumerate(top_nums):
                 fig = px.histogram(df, x=col, nbins=35, title=f"Distribuicao - {col}", marginal="box")
+                add_mean_median_lines(fig, df[col], axis="x")
+                fig = apply_analytics_chart_layout(fig, height=390)
                 c[i].plotly_chart(fig, use_container_width=True, key=f"{key_prefix}_hist_{i}_{col}")
+                with c[i]:
+                    add_chart_reading(f"Distribuicao - {col}", numeric_distribution_reading(df, col))
             fig_box = px.box(df[top_nums], y=top_nums, title="Comparativo de dispersao")
+            fig_box = apply_analytics_chart_layout(fig_box)
             st.plotly_chart(fig_box, use_container_width=True, key=f"{key_prefix}_box_compare")
 
     if groups["categorical"]:
@@ -2389,18 +2568,44 @@ def render_auto_charts(df: pd.DataFrame, groups: dict[str, List[str]], top_corr:
         if chosen:
             c = st.columns(len(chosen))
             for i, col in enumerate(chosen):
-                counts = df[col].fillna("NULO").astype(str).value_counts().head(12).reset_index()
-                counts.columns = [col, "quantidade"]
-                fig = px.bar(counts, x=col, y="quantidade", title=f"Top categorias - {col}", text="quantidade")
+                counts = categorical_distribution(df, col, top_n=12)
+                fig = px.bar(
+                    counts,
+                    x=col,
+                    y="quantidade",
+                    title=f"Top categorias - {col}",
+                    text="quantidade",
+                    color="participacao_pct",
+                    color_continuous_scale=["#BAE6FD", "#0369A1"],
+                )
+                fig.add_scatter(
+                    x=counts[col],
+                    y=counts["acumulado_pct"],
+                    mode="lines+markers",
+                    name="% acumulado",
+                    yaxis="y2",
+                    line=dict(color="#F97316", width=3),
+                )
+                fig.update_layout(yaxis2=dict(title="% acumulado", overlaying="y", side="right", range=[0, 105]))
+                fig = apply_analytics_chart_layout(fig, height=420)
                 c[i].plotly_chart(fig, use_container_width=True, key=f"{key_prefix}_cat_{i}_{col}")
+                with c[i]:
+                    add_chart_reading(f"Top categorias - {col}", category_reading(counts, col))
 
     if groups["datetime"] and metric_numeric:
         date_col = max(groups["datetime"], key=lambda x: df[x].notna().sum())
         metric_col = max(metric_numeric, key=lambda x: df[x].var(skipna=True) if pd.notna(df[x].var(skipna=True)) else -1)
         comp = period_comparison(df, date_col, metric_col)
         if comp:
-            fig = px.line(comp["series"], x=date_col, y=metric_col, markers=True, title=f"Serie temporal de {metric_col}")
+            series = comp["series"].copy()
+            if metric_col not in series.columns and "valor" in series.columns:
+                series = series.rename(columns={"valor": metric_col})
+            trend = enrich_trend_dataframe(series, date_col, metric_col)
+            fig = px.line(trend, x=date_col, y=metric_col, markers=True, title=f"Serie temporal de {metric_col}")
+            fig.add_scatter(x=trend[date_col], y=trend["media_movel"], mode="lines", name="media movel", line=dict(color="#F97316", width=3))
+            fig = apply_analytics_chart_layout(fig)
             st.plotly_chart(fig, use_container_width=True, key=f"{key_prefix}_time_metric_{date_col}_{metric_col}")
+            add_chart_reading(f"Serie temporal de {metric_col}", trend_reading(trend, metric_col))
     elif groups["datetime"] and volume_col:
         date_col = max(groups["datetime"], key=lambda x: df[x].notna().sum())
         comp = period_comparison(df, date_col, volume_col, agg_mode="nunique")
@@ -2408,8 +2613,12 @@ def render_auto_charts(df: pd.DataFrame, groups: dict[str, List[str]], top_corr:
             series = comp["series"].copy()
             value_name = "quantidade_registros"
             series.columns = [date_col, value_name]
-            fig = px.line(series, x=date_col, y=value_name, markers=True, title=f"Serie temporal de quantidade ({volume_col})")
+            trend = enrich_trend_dataframe(series, date_col, value_name)
+            fig = px.line(trend, x=date_col, y=value_name, markers=True, title=f"Serie temporal de quantidade ({volume_col})")
+            fig.add_scatter(x=trend[date_col], y=trend["media_movel"], mode="lines", name="media movel", line=dict(color="#F97316", width=3))
+            fig = apply_analytics_chart_layout(fig)
             st.plotly_chart(fig, use_container_width=True, key=f"{key_prefix}_time_volume_{date_col}_{volume_col}")
+            add_chart_reading(f"Serie temporal de quantidade ({volume_col})", trend_reading(trend, value_name))
 
     if not top_corr.empty:
         c1 = top_corr.iloc[0]["variavel_1"]
@@ -2417,7 +2626,14 @@ def render_auto_charts(df: pd.DataFrame, groups: dict[str, List[str]], top_corr:
         base = df[[c1, c2]].dropna().head(5000)
         if len(base) >= 10:
             fig = px.scatter(base, x=c1, y=c2, title=f"Relacao entre {c1} e {c2}", opacity=0.7)
+            if base[c1].nunique(dropna=True) > 1:
+                coef = np.polyfit(base[c1].astype(float), base[c2].astype(float), 1)
+                x_line = np.linspace(float(base[c1].min()), float(base[c1].max()), 50)
+                y_line = coef[0] * x_line + coef[1]
+                fig.add_scatter(x=x_line, y=y_line, mode="lines", name="tendencia", line=dict(color="#F97316", width=3))
+            fig = apply_analytics_chart_layout(fig)
             st.plotly_chart(fig, use_container_width=True, key=f"{key_prefix}_scatter_corr_{c1}_{c2}")
+            add_chart_reading(f"Relacao entre {c1} e {c2}", scatter_reading(base, c1, c2))
 
 
 def render_management_dashboard(
@@ -2540,43 +2756,77 @@ def render_management_dashboard(
     }
 
     if cat_col:
-        dist = dashboard_df[cat_col].fillna("NULO").astype(str).value_counts().head(top_n).reset_index()
-        dist.columns = [cat_col, "quantidade"]
+        dist = categorical_distribution(dashboard_df, cat_col, top_n=top_n)
         left, right = st.columns(2)
-        st.caption("A pizza mostra participacao por quantidade. A barra usa a metrica principal e a agregacao selecionadas.")
+        st.caption("A pizza mostra participacao por quantidade. A barra mostra ranking/Pareto com percentual acumulado.")
+        pie_fig = px.pie(dist, names=cat_col, values="quantidade", title=f"Participacao por {cat_col}", hole=0.42)
+        pie_fig = apply_analytics_chart_layout(pie_fig, height=420)
         left.plotly_chart(
-            px.pie(dist, names=cat_col, values="quantidade", title=f"Participacao por {cat_col}"),
+            pie_fig,
             use_container_width=True,
             key=f"{key_prefix}_pie_{cat_col}",
         )
+        with left:
+            add_chart_reading(f"Participacao por {cat_col}", category_reading(dist, cat_col))
 
         if metric_numeric and dist_col:
             metric_col = dist_col
-            grp = dashboard_df[[cat_col, metric_col]].dropna(subset=[cat_col]).copy()
-            grp[cat_col] = grp[cat_col].astype(str)
-            value_col = metric_col
-            if agg_mode == "Media":
-                out = grp.groupby(cat_col, as_index=False)[metric_col].mean()
-            elif agg_mode == "Mediana":
-                out = grp.groupby(cat_col, as_index=False)[metric_col].median()
-            elif agg_mode == "Contagem":
-                out = grp.groupby(cat_col, as_index=False).size().rename(columns={"size": "contagem"})
-                value_col = "contagem"
-            else:
-                out = grp.groupby(cat_col, as_index=False)[metric_col].sum()
-            out = out.sort_values(value_col, ascending=False).head(top_n)
-            title = f"Contagem de registros por {cat_col}" if agg_mode == "Contagem" else f"{agg_mode} de {metric_col} por {cat_col}"
+            out, value_col, title = build_metric_by_category(dashboard_df, cat_col, metric_col, agg_mode, top_n)
+            out["participacao_pct"] = out[value_col] / max(float(out[value_col].sum()), 1e-9) * 100.0
+            out["acumulado_pct"] = out["participacao_pct"].cumsum()
+            bar_fig = px.bar(
+                out,
+                x=cat_col,
+                y=value_col,
+                text=value_col,
+                title=title,
+                color="participacao_pct",
+                color_continuous_scale=["#DCFCE7", "#15803D"],
+            )
+            bar_fig.add_scatter(
+                x=out[cat_col],
+                y=out["acumulado_pct"],
+                mode="lines+markers",
+                name="% acumulado",
+                yaxis="y2",
+                line=dict(color="#F97316", width=3),
+            )
+            bar_fig.update_layout(yaxis2=dict(title="% acumulado", overlaying="y", side="right", range=[0, 105]))
+            bar_fig = apply_analytics_chart_layout(bar_fig, height=420)
             right.plotly_chart(
-                px.bar(out, x=cat_col, y=value_col, text=value_col, title=title),
+                bar_fig,
                 use_container_width=True,
                 key=f"{key_prefix}_metric_top_{cat_col}_{value_col}_{agg_mode}",
             )
+            with right:
+                add_chart_reading(title, metric_category_reading(out, cat_col, value_col, title))
         else:
+            bar_fig = px.bar(
+                dist,
+                x=cat_col,
+                y="quantidade",
+                text="quantidade",
+                title=f"Top {top_n} categorias - {cat_col}",
+                color="participacao_pct",
+                color_continuous_scale=["#DBEAFE", "#1D4ED8"],
+            )
+            bar_fig.add_scatter(
+                x=dist[cat_col],
+                y=dist["acumulado_pct"],
+                mode="lines+markers",
+                name="% acumulado",
+                yaxis="y2",
+                line=dict(color="#F97316", width=3),
+            )
+            bar_fig.update_layout(yaxis2=dict(title="% acumulado", overlaying="y", side="right", range=[0, 105]))
+            bar_fig = apply_analytics_chart_layout(bar_fig, height=420)
             right.plotly_chart(
-                px.bar(dist, x=cat_col, y="quantidade", text="quantidade", title=f"Top {top_n} categorias - {cat_col}"),
+                bar_fig,
                 use_container_width=True,
                 key=f"{key_prefix}_bar_top_{cat_col}",
             )
+            with right:
+                add_chart_reading(f"Top {top_n} categorias - {cat_col}", category_reading(dist, cat_col))
 
     if date_col:
         trend_choices = ["Linhas por periodo"]
@@ -2617,35 +2867,58 @@ def render_management_dashboard(
 
             if date_col not in trend.columns:
                 trend = trend.rename(columns={trend.columns[0]: date_col})
+            trend = enrich_trend_dataframe(trend, date_col, y_name)
             chart_left, chart_right = st.columns(2)
+            line_fig = px.line(trend, x=date_col, y=y_name, markers=True, title=f"Tendencia por {freq_label}")
+            line_fig.add_scatter(x=trend[date_col], y=trend["media_movel"], mode="lines", name="media movel", line=dict(color="#F97316", width=3))
+            line_fig = apply_analytics_chart_layout(line_fig)
             chart_left.plotly_chart(
-                px.line(trend, x=date_col, y=y_name, markers=True, title=f"Tendencia por {freq_label}"),
+                line_fig,
                 use_container_width=True,
                 key=f"{key_prefix}_trend_line_{date_col}_{trend_choice}_{metric_agg}",
             )
+            with chart_left:
+                add_chart_reading(f"Tendencia por {freq_label}", trend_reading(trend, y_name))
+            bar_trend_fig = px.bar(trend, x=date_col, y=y_name, title=f"Volume por {freq_label}", color="variacao_pct", color_continuous_scale=["#DC2626", "#F8FAFC", "#16A34A"])
+            bar_trend_fig = apply_analytics_chart_layout(bar_trend_fig)
             chart_right.plotly_chart(
-                px.bar(trend, x=date_col, y=y_name, title=f"Volume por {freq_label}"),
+                bar_trend_fig,
                 use_container_width=True,
                 key=f"{key_prefix}_trend_bar_{date_col}_{trend_choice}_{metric_agg}",
             )
 
     if dist_col:
         dist_left, dist_right = st.columns(2)
+        hist_fig = px.histogram(dashboard_df, x=dist_col, nbins=35, title=f"Distribuicao de {dist_col}", marginal="box")
+        add_mean_median_lines(hist_fig, dashboard_df[dist_col], axis="x")
+        hist_fig = apply_analytics_chart_layout(hist_fig)
         dist_left.plotly_chart(
-            px.histogram(dashboard_df, x=dist_col, nbins=35, title=f"Distribuicao de {dist_col}", marginal="box"),
+            hist_fig,
             use_container_width=True,
             key=f"{key_prefix}_dist_hist_{dist_col}",
         )
+        with dist_left:
+            add_chart_reading(f"Distribuicao de {dist_col}", numeric_distribution_reading(dashboard_df, dist_col))
         if cat_col:
             bx = dashboard_df[[cat_col, dist_col]].dropna(subset=[cat_col, dist_col]).copy()
             bx[cat_col] = bx[cat_col].astype(str)
             top_cat_values = bx[cat_col].value_counts().head(top_n).index.tolist()
             bx = bx[bx[cat_col].isin(top_cat_values)]
+            box_fig = px.box(bx, x=cat_col, y=dist_col, title=f"Dispersao de {dist_col} por {cat_col}", points="outliers")
+            box_fig = apply_analytics_chart_layout(box_fig)
             dist_right.plotly_chart(
-                px.box(bx, x=cat_col, y=dist_col, title=f"Dispersao de {dist_col} por {cat_col}"),
+                box_fig,
                 use_container_width=True,
                 key=f"{key_prefix}_dist_box_{cat_col}_{dist_col}",
             )
+            with dist_right:
+                add_chart_reading(
+                    f"Dispersao de {dist_col} por {cat_col}",
+                    [
+                        "O boxplot compara mediana, dispersao e outliers entre grupos.",
+                        "Grupos com caixas mais altas ou muitos pontos extremos merecem investigacao operacional.",
+                    ],
+                )
 
     if len(metric_numeric) >= 2:
         scatter_left, scatter_right = st.columns(2)
@@ -2658,20 +2931,39 @@ def render_management_dashboard(
         )
         base = dashboard_df[[x_col, y_col]].dropna().head(4000)
         if len(base) > 0:
+            scatter_fig = px.scatter(base, x=x_col, y=y_col, opacity=0.7, title=f"Relacao entre {x_col} e {y_col}")
+            if base[x_col].nunique(dropna=True) > 1:
+                coef = np.polyfit(base[x_col].astype(float), base[y_col].astype(float), 1)
+                x_line = np.linspace(float(base[x_col].min()), float(base[x_col].max()), 50)
+                y_line = coef[0] * x_line + coef[1]
+                scatter_fig.add_scatter(x=x_line, y=y_line, mode="lines", name="tendencia", line=dict(color="#F97316", width=3))
+            scatter_fig = apply_analytics_chart_layout(scatter_fig)
             st.plotly_chart(
-                px.scatter(base, x=x_col, y=y_col, opacity=0.7, title=f"Relacao entre {x_col} e {y_col}"),
+                scatter_fig,
                 use_container_width=True,
                 key=f"{key_prefix}_scatter_{x_col}_{y_col}",
             )
+            add_chart_reading(f"Relacao entre {x_col} e {y_col}", scatter_reading(base, x_col, y_col))
 
     if len(metric_numeric) >= 2:
         top_numeric = metric_numeric[: min(12, len(metric_numeric))]
         corr = dashboard_df[top_numeric].corr(numeric_only=True)
+        corr_fig = px.imshow(corr, text_auto=True, title="Heatmap de correlacao (top numericas)", color_continuous_scale="RdBu_r", zmin=-1, zmax=1)
+        corr_fig = apply_analytics_chart_layout(corr_fig, height=520)
         st.plotly_chart(
-            px.imshow(corr, text_auto=True, title="Heatmap de correlacao (top numericas)"),
+            corr_fig,
             use_container_width=True,
             key=f"{key_prefix}_heatmap_corr",
         )
+        corr_pairs = strongest_correlations(dashboard_df[top_numeric], top_n=3)
+        if len(corr_pairs) > 0:
+            add_chart_reading(
+                "Heatmap de correlacao",
+                [
+                    f"{row['variavel_1']} x {row['variavel_2']}: correlacao {float(row['correlacao']):.3f}."
+                    for _, row in corr_pairs.iterrows()
+                ],
+            )
 
     if len(issue_catalog) > 0:
         st.markdown("**Top riscos para a gerencia**")
