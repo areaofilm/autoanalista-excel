@@ -580,8 +580,7 @@ def login_panel() -> Optional[dict]:
         st.sidebar.error(f"Login bloqueado temporariamente. Tente novamente em {remaining} min.")
 
     if demo_mode:
-        st.sidebar.caption("Modo demo ativo (recomendado configurar usuarios via secrets/env).")
-        st.sidebar.caption("admin / admin2026!  |  analista / analista2026!  |  viewer / viewer2026!")
+        st.sidebar.caption("Modo demo ativo. Configure usuarios seguros via secrets/env antes de uso em producao.")
 
     username = st.sidebar.text_input("Usuario", value="")
     password = st.sidebar.text_input("Senha", type="password", value="")
@@ -1695,8 +1694,12 @@ def render_global_filters(df: pd.DataFrame, groups: dict[str, List[str]]) -> Tup
                 default=opts,
                 key=f"flt_cat_{filter_context}_{col}",
             )
-            filtered = filtered[values.isin(selected)]
-            active.append(f"{col}: {len(selected)} categorias")
+            if selected:
+                filtered = filtered[values.isin(selected)]
+                active.append(f"{col}: {len(selected)} categorias")
+            else:
+                filtered = filtered.iloc[0:0].copy()
+                active.append(f"{col}: nenhuma categoria selecionada")
 
     return filtered, active
 
@@ -1914,22 +1917,37 @@ def format_kpi_metric(item: dict) -> str:
     return f"{value:.2f}"
 
 
-def apply_dashboard_filters(
+def apply_inline_filters(
     df: pd.DataFrame,
     groups: dict[str, List[str]],
     *,
-    key_prefix: str = "dash",
+    key_prefix: str,
+    title: str,
+    expanded: bool = False,
+    max_categories: int = 80,
 ) -> Tuple[pd.DataFrame, List[str]]:
     filtered = df.copy()
     active_filters: List[str] = []
     metric_numeric, _ = select_numeric_metric_columns(df, groups)
 
-    with st.expander("Filtros do Dashboard", expanded=False):
-        date_col = st.selectbox(
+    with st.expander(title, expanded=expanded):
+        c1, c2, c3 = st.columns(3)
+        date_col = c1.selectbox(
             "Filtro por data",
             options=["(sem filtro)"] + groups["datetime"],
-            key=f"{key_prefix}_flt_date_col",
+            key=f"{key_prefix}_date_col",
         )
+        cat_col = c2.selectbox(
+            "Filtro por categoria",
+            options=["(sem filtro)"] + groups["categorical"],
+            key=f"{key_prefix}_cat_col",
+        )
+        num_col = c3.selectbox(
+            "Filtro por metrica numerica",
+            options=["(sem filtro)"] + metric_numeric,
+            key=f"{key_prefix}_num_col",
+        )
+
         if date_col != "(sem filtro)":
             dt = pd.to_datetime(filtered[date_col], errors="coerce", dayfirst=True)
             valid = dt.dropna()
@@ -1938,38 +1956,31 @@ def apply_dashboard_filters(
                 chosen = st.date_input(
                     "Periodo",
                     value=(dmin, dmax),
-                    key=f"{key_prefix}_flt_date_range",
+                    key=f"{key_prefix}_date_range_{normalize_token_text(date_col)}",
                 )
                 if isinstance(chosen, tuple) and len(chosen) == 2:
                     start, end = chosen
                     filtered = filtered[(dt.isna()) | ((dt.dt.date >= start) & (dt.dt.date <= end))]
                     active_filters.append(f"{date_col}: {start} ate {end}")
 
-        cat_col = st.selectbox(
-            "Filtro por categoria",
-            options=["(sem filtro)"] + groups["categorical"],
-            key=f"{key_prefix}_flt_cat_col",
-        )
         if cat_col != "(sem filtro)":
             values = filtered[cat_col].fillna("NULO").astype(str)
-            opts = values.value_counts().head(40).index.tolist()
+            opts = values.value_counts().head(max_categories).index.tolist()
             selected = st.multiselect(
                 "Categorias selecionadas",
                 options=opts,
                 default=opts,
-                key=f"{key_prefix}_flt_cat_values",
+                key=f"{key_prefix}_cat_values_{normalize_token_text(cat_col)}",
             )
             if selected:
                 filtered = filtered[values.isin(selected)]
                 active_filters.append(f"{cat_col}: {len(selected)} categorias")
+            else:
+                filtered = filtered.iloc[0:0].copy()
+                active_filters.append(f"{cat_col}: nenhuma categoria selecionada")
 
-        num_col = st.selectbox(
-            "Filtro por metrica numerica",
-            options=["(sem filtro)"] + metric_numeric,
-            key=f"{key_prefix}_flt_num_col",
-        )
-        if num_col != "(sem filtro)":
-            non_null = filtered[num_col].dropna()
+        if num_col != "(sem filtro)" and not filtered.empty:
+            non_null = pd.to_numeric(filtered[num_col], errors="coerce").dropna()
             if len(non_null) > 0:
                 min_v = float(non_null.min())
                 max_v = float(non_null.max())
@@ -1979,12 +1990,31 @@ def apply_dashboard_filters(
                         min_value=min_v,
                         max_value=max_v,
                         value=(min_v, max_v),
-                        key=f"{key_prefix}_flt_num_range",
+                        key=f"{key_prefix}_num_range_{normalize_token_text(num_col)}",
                     )
-                    filtered = filtered[(filtered[num_col].isna()) | ((filtered[num_col] >= chosen[0]) & (filtered[num_col] <= chosen[1]))]
+                    numeric_series = pd.to_numeric(filtered[num_col], errors="coerce")
+                    filtered = filtered[(numeric_series.isna()) | ((numeric_series >= chosen[0]) & (numeric_series <= chosen[1]))]
                     active_filters.append(f"{num_col}: {chosen[0]:.2f} ate {chosen[1]:.2f}")
 
+        st.caption(f"Registros no recorte: {len(filtered):,}".replace(",", "."))
+
     return filtered, active_filters
+
+
+def apply_dashboard_filters(
+    df: pd.DataFrame,
+    groups: dict[str, List[str]],
+    *,
+    key_prefix: str = "dash",
+) -> Tuple[pd.DataFrame, List[str]]:
+    return apply_inline_filters(
+        df,
+        groups,
+        key_prefix=f"{key_prefix}_flt",
+        title="Filtros do Dashboard",
+        expanded=False,
+        max_categories=40,
+    )
 
 
 def build_dashboard_narrative(
@@ -3920,32 +3950,59 @@ def main() -> None:
 
     with tabs[3]:
         st.subheader("Insights e Visualizacoes")
-        st.markdown("**Insights automaticos**")
-        for i in insights:
-            st.markdown(f"- {i}")
-        st.markdown("**Plano de acao recomendado**")
-        for r in recommendations:
-            st.markdown(f"- {r}")
-        st.markdown("**KPIs detectados automaticamente**")
-        if kpis:
-            cols = st.columns(len(kpis))
-            for i, item in enumerate(kpis):
-                delta = item["delta_text"] if item["delta_text"] else None
-                cols[i].metric(item["name"], format_kpi_metric(item), delta=delta)
-                if item["alert"]:
-                    cols[i].caption(item["alert"])
+        insights_df, insight_filters = apply_inline_filters(
+            analysis_df,
+            groups,
+            key_prefix=f"insights_filters_{analysis_key}",
+            title="Filtros da aba Insights",
+            expanded=False,
+            max_categories=80,
+        )
+        if insight_filters:
+            st.caption("Filtros ativos em Insights: " + " | ".join(insight_filters))
+        if insights_df.empty:
+            st.warning("Os filtros da aba Insights removeram todos os registros. Ajuste o recorte para recalcular os insights.")
         else:
-            st.info("Sem KPIs suficientes para deteccao automatica.")
-        render_auto_charts(analysis_df, groups, top_corr, key_prefix=f"insights_{analysis_key}")
-        if len(top_corr) > 0:
-            st.markdown("**Correlacoes de destaque**")
-            st.dataframe(top_corr, use_container_width=True)
-            corr_matrix = analysis_df[groups["numeric"]].corr(numeric_only=True)
-            st.plotly_chart(
-                px.imshow(corr_matrix, text_auto=True, aspect="auto", title="Matriz de correlacao"),
-                use_container_width=True,
-                key=f"insights_corr_{analysis_key}",
+            insights_groups = get_column_groups(insights_df)
+            insights_quality = compute_quality_report(insights_df, insights_groups, pd.DataFrame())
+            insights_corr = strongest_correlations(insights_df, top_n=10)
+            insights_kpis = detect_kpis(insights_df, insights_groups)
+            insights_notes = generate_professional_insights(
+                insights_df,
+                insights_groups,
+                insights_quality,
+                insights_corr,
+                insights_kpis,
+                treatment_report=treatment_report,
             )
+            st.markdown("**Insights automaticos**")
+            for i in insights_notes:
+                st.markdown(f"- {i}")
+            st.markdown("**Plano de acao recomendado**")
+            for r in recommendations:
+                st.markdown(f"- {r}")
+            st.markdown("**KPIs detectados automaticamente**")
+            if insights_kpis:
+                cols = st.columns(len(insights_kpis))
+                for i, item in enumerate(insights_kpis):
+                    delta = item["delta_text"] if item["delta_text"] else None
+                    cols[i].metric(item["name"], format_kpi_metric(item), delta=delta)
+                    if item["alert"]:
+                        cols[i].caption(item["alert"])
+            else:
+                st.info("Sem KPIs suficientes para deteccao automatica.")
+            render_auto_charts(insights_df, insights_groups, insights_corr, key_prefix=f"insights_{analysis_key}")
+            if len(insights_corr) > 0:
+                st.markdown("**Correlacoes de destaque**")
+                st.dataframe(insights_corr, use_container_width=True)
+                insight_metric_cols, _ = select_numeric_metric_columns(insights_df, insights_groups)
+                if len(insight_metric_cols) >= 2:
+                    corr_matrix = insights_df[insight_metric_cols].corr(numeric_only=True)
+                    st.plotly_chart(
+                        px.imshow(corr_matrix, text_auto=True, aspect="auto", title="Matriz de correlacao"),
+                        use_container_width=True,
+                        key=f"insights_corr_{analysis_key}_{hash_text('|'.join(insight_filters))[:8]}",
+                    )
 
     ml_unsup = None
     ml_sup = None
