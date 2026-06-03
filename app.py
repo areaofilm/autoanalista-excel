@@ -1,4 +1,5 @@
 import hashlib
+import gzip
 import html
 import hmac
 import io
@@ -7,6 +8,7 @@ import os
 import re
 import sqlite3
 import unicodedata
+import zipfile
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -23,6 +25,17 @@ from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.platypus import PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+try:
+    from pptx import Presentation
+    from pptx.dml.color import RGBColor
+    from pptx.enum.text import PP_ALIGN
+    from pptx.util import Inches, Pt
+except Exception:  # pragma: no cover - optional until dependency is installed
+    Presentation = None
+    RGBColor = None
+    PP_ALIGN = None
+    Inches = None
+    Pt = None
 from sklearn.cluster import KMeans
 from sklearn.compose import ColumnTransformer
 from sklearn.decomposition import PCA
@@ -210,8 +223,25 @@ def init_local_database(migrate_json: bool = True) -> int:
             """
         )
         conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS stored_sheets (
+                id TEXT PRIMARY KEY,
+                timestamp TEXT NOT NULL,
+                user TEXT,
+                file_name TEXT,
+                sheet_name TEXT,
+                rows INTEGER,
+                cols INTEGER,
+                quality_score REAL,
+                version INTEGER,
+                metadata_json TEXT,
+                csv_gzip BLOB
+            )
+            """
+        )
+        conn.execute(
             "INSERT OR REPLACE INTO app_meta (key, value) VALUES (?, ?)",
-            ("schema_version", "1"),
+            ("schema_version", "2"),
         )
         inserted = 0
         if migrate_json:
@@ -302,12 +332,107 @@ def clear_analysis_history() -> None:
             conn.close()
 
 
+def dataframe_to_gzip_csv(df: pd.DataFrame) -> bytes:
+    csv_bytes = df.to_csv(index=False).encode("utf-8")
+    return gzip.compress(csv_bytes)
+
+
+def dataframe_from_gzip_csv(blob: bytes) -> pd.DataFrame:
+    return pd.read_csv(io.BytesIO(gzip.decompress(blob)))
+
+
+def save_sheet_to_local_db(
+    df: pd.DataFrame,
+    *,
+    user: str,
+    file_name: str,
+    sheet_name: str,
+    quality_score: float,
+    version: int,
+    metadata: Optional[dict] = None,
+) -> str:
+    init_local_database(migrate_json=False)
+    stored_id = hash_text(f"{user}|{file_name}|{sheet_name}|{version}|{datetime.now().isoformat()}")[:24]
+    payload = dataframe_to_gzip_csv(df.head(MAX_EXPORT_ROWS))
+    conn = connect_local_database()
+    try:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO stored_sheets
+            (id, timestamp, user, file_name, sheet_name, rows, cols, quality_score, version, metadata_json, csv_gzip)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                stored_id,
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                user,
+                file_name,
+                sheet_name,
+                int(len(df)),
+                int(df.shape[1]),
+                float(quality_score),
+                int(version),
+                json.dumps(metadata or {}, ensure_ascii=False, default=str),
+                payload,
+            ),
+        )
+        conn.commit()
+        return stored_id
+    finally:
+        conn.close()
+
+
+def list_stored_sheets() -> pd.DataFrame:
+    if not local_database_installed():
+        return pd.DataFrame()
+    init_local_database(migrate_json=False)
+    conn = connect_local_database()
+    try:
+        rows = conn.execute(
+            """
+            SELECT id, timestamp, user, file_name, sheet_name, rows, cols, quality_score, version
+            FROM stored_sheets
+            ORDER BY timestamp DESC
+            """
+        ).fetchall()
+        return pd.DataFrame([dict(row) for row in rows])
+    finally:
+        conn.close()
+
+
+def load_stored_sheet(stored_id: str) -> Optional[pd.DataFrame]:
+    if not local_database_installed():
+        return None
+    init_local_database(migrate_json=False)
+    conn = connect_local_database()
+    try:
+        row = conn.execute("SELECT csv_gzip FROM stored_sheets WHERE id = ?", (stored_id,)).fetchone()
+        if row is None:
+            return None
+        return dataframe_from_gzip_csv(row["csv_gzip"])
+    finally:
+        conn.close()
+
+
+def clear_stored_sheets() -> None:
+    if not local_database_installed():
+        return
+    init_local_database(migrate_json=False)
+    conn = connect_local_database()
+    try:
+        conn.execute("DELETE FROM stored_sheets")
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def database_status_label() -> str:
     if not local_database_installed():
         return "Nao instalado"
     try:
         total = len(load_history_from_db())
-        return f"Instalado ({total} registros)"
+        stored_total = len(list_stored_sheets())
+        return f"Instalado ({total} historico, {stored_total} planilhas)"
     except Exception:
         return "Instalado com pendencia de inicializacao"
 
@@ -3342,6 +3467,274 @@ def run_supervised_ml(
     }
 
 
+def compare_dataframes(current_df: pd.DataFrame, other_df: pd.DataFrame, current_name: str = "Atual", other_name: str = "Comparacao") -> dict:
+    current_groups = get_column_groups(current_df)
+    other_groups = get_column_groups(other_df)
+    current_quality = compute_quality_report(current_df, current_groups, pd.DataFrame())
+    other_quality = compute_quality_report(other_df, other_groups, pd.DataFrame())
+
+    common_cols = [c for c in current_df.columns if c in other_df.columns]
+    new_cols = [c for c in current_df.columns if c not in other_df.columns]
+    removed_cols = [c for c in other_df.columns if c not in current_df.columns]
+    common_numeric = [c for c in common_cols if c in current_groups["numeric"] and c in other_groups["numeric"]]
+    common_categorical = [c for c in common_cols if c in current_groups["categorical"] and c in other_groups["categorical"]]
+
+    summary_df = pd.DataFrame(
+        [
+            {"indicador": "Linhas", current_name: len(current_df), other_name: len(other_df), "delta": len(current_df) - len(other_df)},
+            {"indicador": "Colunas", current_name: current_df.shape[1], other_name: other_df.shape[1], "delta": current_df.shape[1] - other_df.shape[1]},
+            {
+                "indicador": "Score qualidade",
+                current_name: round(current_quality["score"], 2),
+                other_name: round(other_quality["score"], 2),
+                "delta": round(current_quality["score"] - other_quality["score"], 2),
+            },
+            {
+                "indicador": "Ausencia %",
+                current_name: round(current_quality["missing_ratio"] * 100, 2),
+                other_name: round(other_quality["missing_ratio"] * 100, 2),
+                "delta": round((current_quality["missing_ratio"] - other_quality["missing_ratio"]) * 100, 2),
+            },
+            {
+                "indicador": "Duplicadas",
+                current_name: current_quality["duplicates"],
+                other_name: other_quality["duplicates"],
+                "delta": current_quality["duplicates"] - other_quality["duplicates"],
+            },
+        ]
+    )
+
+    numeric_rows = []
+    for col in common_numeric[:30]:
+        cur = pd.to_numeric(current_df[col], errors="coerce")
+        oth = pd.to_numeric(other_df[col], errors="coerce")
+        cur_sum, oth_sum = float(cur.sum(skipna=True)), float(oth.sum(skipna=True))
+        cur_mean, oth_mean = float(cur.mean(skipna=True)), float(oth.mean(skipna=True))
+        numeric_rows.append(
+            {
+                "coluna": col,
+                f"soma_{current_name}": cur_sum,
+                f"soma_{other_name}": oth_sum,
+                "delta_soma": cur_sum - oth_sum,
+                f"media_{current_name}": cur_mean,
+                f"media_{other_name}": oth_mean,
+                "delta_media": cur_mean - oth_mean,
+            }
+        )
+    numeric_df = pd.DataFrame(numeric_rows).sort_values("delta_soma", key=lambda s: s.abs(), ascending=False) if numeric_rows else pd.DataFrame()
+
+    category_rows = []
+    for col in common_categorical[:8]:
+        cur_top = current_df[col].fillna("NULO").astype(str).value_counts(normalize=True).head(1)
+        oth_top = other_df[col].fillna("NULO").astype(str).value_counts(normalize=True).head(1)
+        if len(cur_top) == 0 or len(oth_top) == 0:
+            continue
+        category_rows.append(
+            {
+                "coluna": col,
+                f"top_{current_name}": cur_top.index[0],
+                f"participacao_{current_name}_pct": round(float(cur_top.iloc[0]) * 100, 2),
+                f"top_{other_name}": oth_top.index[0],
+                f"participacao_{other_name}_pct": round(float(oth_top.iloc[0]) * 100, 2),
+            }
+        )
+    category_df = pd.DataFrame(category_rows)
+
+    insights = []
+    row_delta = len(current_df) - len(other_df)
+    if row_delta != 0:
+        direction = "aumentou" if row_delta > 0 else "reduziu"
+        insights.append(f"O volume de linhas {direction} em {abs(row_delta):,} registro(s).".replace(",", "."))
+    score_delta = current_quality["score"] - other_quality["score"]
+    if abs(score_delta) >= 5:
+        direction = "melhorou" if score_delta > 0 else "piorou"
+        insights.append(f"O score de qualidade {direction} {abs(score_delta):.1f} ponto(s).")
+    if new_cols:
+        insights.append("Novas colunas na base atual: " + ", ".join(new_cols[:5]) + ".")
+    if removed_cols:
+        insights.append("Colunas ausentes na base atual: " + ", ".join(removed_cols[:5]) + ".")
+    if len(numeric_df) > 0:
+        row = numeric_df.iloc[0]
+        insights.append(f"Maior variacao numerica em `{row['coluna']}`: delta de soma {float(row['delta_soma']):,.2f}.".replace(",", "."))
+    if not insights:
+        insights.append("As bases comparadas apresentam variacao baixa nos principais indicadores automaticos.")
+
+    return {
+        "summary_df": summary_df,
+        "numeric_df": numeric_df,
+        "category_df": category_df,
+        "insights": insights,
+        "new_cols": new_cols,
+        "removed_cols": removed_cols,
+        "current_quality": current_quality,
+        "other_quality": other_quality,
+    }
+
+
+def generate_comparison_excel(comparison: dict) -> bytes:
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        comparison["summary_df"].to_excel(writer, sheet_name="resumo", index=False)
+        if len(comparison["numeric_df"]) > 0:
+            comparison["numeric_df"].to_excel(writer, sheet_name="numericas", index=False)
+        if len(comparison["category_df"]) > 0:
+            comparison["category_df"].to_excel(writer, sheet_name="categorias", index=False)
+        pd.DataFrame({"insight": comparison["insights"]}).to_excel(writer, sheet_name="insights", index=False)
+        pd.DataFrame({"colunas_novas": comparison["new_cols"]}).to_excel(writer, sheet_name="colunas_novas", index=False)
+        pd.DataFrame({"colunas_removidas": comparison["removed_cols"]}).to_excel(writer, sheet_name="colunas_removidas", index=False)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def ppt_add_title(slide, title: str, subtitle: str = "") -> None:
+    if slide.shapes.title is not None:
+        slide.shapes.title.text = clean_report_text(title, 120)
+    else:
+        box = slide.shapes.add_textbox(Inches(0.5), Inches(0.25), Inches(9.0), Inches(0.5))
+        box.text_frame.text = clean_report_text(title, 120)
+    if subtitle and len(slide.placeholders) > 1:
+        slide.placeholders[1].text = clean_report_text(subtitle, 220)
+
+
+def ppt_add_bullets(slide, bullets: List[str], left: float = 0.7, top: float = 1.55, width: float = 8.8, height: float = 4.8) -> None:
+    box = slide.shapes.add_textbox(Inches(left), Inches(top), Inches(width), Inches(height))
+    frame = box.text_frame
+    frame.word_wrap = True
+    for i, item in enumerate(bullets[:8]):
+        p = frame.paragraphs[0] if i == 0 else frame.add_paragraph()
+        p.text = clean_report_text(item, 240)
+        p.level = 0
+        p.font.size = Pt(18 if i == 0 else 15)
+
+
+def ppt_add_table(slide, df: pd.DataFrame, left: float, top: float, width: float, height: float, max_rows: int = 6) -> None:
+    if df.empty:
+        ppt_add_bullets(slide, ["Sem dados suficientes para esta tabela."], left=left, top=top, width=width, height=height)
+        return
+    data = df.head(max_rows).copy()
+    rows, cols = data.shape[0] + 1, data.shape[1]
+    table = slide.shapes.add_table(rows, cols, Inches(left), Inches(top), Inches(width), Inches(height)).table
+    for j, col in enumerate(data.columns):
+        table.cell(0, j).text = clean_report_text(col, 28)
+    for i, (_, row) in enumerate(data.iterrows(), start=1):
+        for j, col in enumerate(data.columns):
+            table.cell(i, j).text = clean_report_text(row[col], 38)
+    for i in range(rows):
+        for j in range(cols):
+            for paragraph in table.cell(i, j).text_frame.paragraphs:
+                paragraph.font.size = Pt(9)
+
+
+def generate_powerpoint_report(
+    *,
+    source_name: str,
+    sheet_name: str,
+    quality_report: dict,
+    insights: List[str],
+    issue_catalog: pd.DataFrame,
+    dashboard_bundle: Optional[dict],
+    treatment_report: dict,
+    ml_sup: Optional[dict],
+    version: int,
+) -> bytes:
+    if Presentation is None:
+        raise RuntimeError("Dependencia python-pptx nao instalada.")
+    prs = Presentation()
+    prs.core_properties.author = CREATOR_SIGNATURE
+
+    slide = prs.slides.add_slide(prs.slide_layouts[0])
+    ppt_add_title(slide, "AutoAnalista 2026", f"Relatorio executivo | {source_name} | {sheet_name} | v{version}")
+
+    slide = prs.slides.add_slide(prs.slide_layouts[1])
+    ppt_add_title(slide, "Resumo Executivo", f"Score: {quality_report['score']:.1f}/100 ({quality_report['level']})")
+    ppt_add_bullets(
+        slide,
+        [
+            f"Linhas finais analisadas: {treatment_report.get('rows_after', 0):,}".replace(",", "."),
+            f"Linhas removidas na tratativa: {treatment_report.get('total_removed', 0):,}".replace(",", "."),
+            f"Duplicadas removidas: {treatment_report.get('duplicates_removed', 0):,}".replace(",", "."),
+            f"Outliers removidos: {treatment_report.get('outliers_removed', 0):,}".replace(",", "."),
+        ]
+        + insights[:4],
+    )
+
+    slide = prs.slides.add_slide(prs.slide_layouts[5])
+    ppt_add_title(slide, "Dashboard Gerencial", "KPIs e principais categorias")
+    if dashboard_bundle:
+        kpi_df = dashboard_bundle.get("kpi_df", pd.DataFrame())
+        top_cat_df = dashboard_bundle.get("top_categories_df", pd.DataFrame())
+        ppt_add_table(slide, kpi_df, 0.4, 1.2, 4.4, 2.2, max_rows=5)
+        ppt_add_table(slide, top_cat_df[["categoria", "quantidade", "participacao_pct"]] if len(top_cat_df) > 0 else pd.DataFrame(), 5.0, 1.2, 4.6, 2.8, max_rows=6)
+    else:
+        ppt_add_bullets(slide, ["Dashboard nao preparado para esta exportacao."])
+
+    slide = prs.slides.add_slide(prs.slide_layouts[1])
+    ppt_add_title(slide, "Qualidade e Riscos", "Principais pontos de atencao")
+    risk_bullets = []
+    if len(issue_catalog) > 0:
+        for _, row in issue_catalog.sort_values(["priority_rank", "affected_rows"], ascending=[True, False]).head(6).iterrows():
+            risk_bullets.append(f"{row['priority']} | {row['issue']} em {row['column']} | {row['affected_rows']} afetados")
+    else:
+        risk_bullets.append("Sem riscos relevantes catalogados automaticamente.")
+    ppt_add_bullets(slide, risk_bullets)
+
+    slide = prs.slides.add_slide(prs.slide_layouts[1])
+    ppt_add_title(slide, "Plano de Acao", "Prioridades sugeridas")
+    action_df = build_structured_action_plan("Geral", quality_report, issue_catalog)
+    ppt_add_bullets(slide, [f"{r['prioridade']} | {r['acao']} | {r['prazo']}" for _, r in action_df.head(6).iterrows()])
+
+    slide = prs.slides.add_slide(prs.slide_layouts[1])
+    ppt_add_title(slide, "Machine Learning", "Resultado preditivo quando disponivel")
+    if ml_sup:
+        bullets = [f"Modelo: {ml_sup.get('model_choice', '-')}", f"Alvo: {ml_sup.get('target_col', '-')}"]
+        if ml_sup.get("problem_type") == "classification":
+            bullets.append(f"F1 holdout: {ml_sup.get('holdout_f1', 0):.3f}")
+        else:
+            bullets.append(f"R2 holdout: {ml_sup.get('holdout_r2', 0):.3f}")
+        bullets.append(ml_sup.get("model_reliability_alert", "Sem alerta de confiabilidade."))
+    else:
+        bullets = ["Modelo supervisionado nao executado nesta analise."]
+    ppt_add_bullets(slide, bullets)
+
+    buffer = io.BytesIO()
+    prs.save(buffer)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def generate_offline_package() -> bytes:
+    buffer = io.BytesIO()
+    run_bat = """@echo off
+cd /d %~dp0
+python -m venv .venv
+call .venv\\Scripts\\activate
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+streamlit run app.py
+pause
+"""
+    install_md = f"""# AutoAnalista 2026 - pacote offline
+
+Criador: {CREATOR_SIGNATURE}
+
+## Como instalar no computador
+1. Extraia este ZIP em uma pasta local.
+2. Instale Python 3.11 ou superior, se ainda nao tiver.
+3. Dê duplo clique em `INICIAR_AUTOANALISTA.bat`.
+4. Aguarde a instalacao das dependencias.
+5. O app abrira em `http://localhost:8501`.
+
+Depois da primeira instalacao, o app funciona localmente. O banco SQLite fica em `app_data/autoanalista.db`.
+"""
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.write(APP_DIR / "app.py", "app.py")
+        zf.write(APP_DIR / "requirements.txt", "requirements.txt")
+        zf.writestr("INICIAR_AUTOANALISTA.bat", run_bat)
+        zf.writestr("LEIA-ME_INSTALACAO_OFFLINE.md", install_md)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
 def generate_excel_export(
     df: pd.DataFrame,
     quality_report: dict,
@@ -4198,7 +4591,7 @@ def main() -> None:
             disabled=(predictive_target_col == "(nao usar)"),
         )
 
-    tabs = st.tabs(["Resumo", "Dashboard", "Qualidade", "Insights", "ML", "Relatorio"])
+    tabs = st.tabs(["Resumo", "Dashboard", "Qualidade", "Insights", "ML", "Comparacao", "Relatorio"])
 
     with tabs[0]:
         st.subheader("Resumo Executivo")
@@ -4385,6 +4778,99 @@ def main() -> None:
             st.info("Perfil viewer sem permissao para executar ML.")
 
     with tabs[5]:
+        st.subheader("Comparacao entre Planilhas")
+        st.caption("Compare a planilha atual com outro arquivo ou com uma planilha salva no banco SQLite local.")
+        compare_source = st.radio(
+            "Origem da base para comparacao",
+            options=["Enviar outro arquivo", "Usar planilha salva no SQLite"],
+            horizontal=True,
+            key=f"compare_source_{analysis_key}",
+        )
+        compare_df = None
+        compare_label = "Comparacao"
+
+        if compare_source == "Enviar outro arquivo":
+            compare_file = st.file_uploader(
+                "Envie a planilha de comparacao",
+                type=SUPPORTED_TYPES,
+                key=f"compare_upload_{analysis_key}",
+            )
+            if compare_file is not None:
+                try:
+                    compare_workbook = read_workbook(compare_file.getvalue(), compare_file.name)
+                    compare_sheet = (
+                        list(compare_workbook.keys())[0]
+                        if len(compare_workbook) == 1
+                        else st.selectbox(
+                            "Selecione a aba da planilha de comparacao",
+                            options=list(compare_workbook.keys()),
+                            key=f"compare_sheet_{analysis_key}",
+                        )
+                    )
+                    compare_raw = compare_workbook[compare_sheet].copy()
+                    compare_df, _ = coerce_data_types(compare_raw)
+                    compare_label = Path(compare_file.name).stem
+                except Exception as exc:
+                    st.error("Nao foi possivel ler a planilha de comparacao.")
+                    st.caption(str(exc)[:500])
+        else:
+            stored_df = list_stored_sheets()
+            if len(stored_df) == 0:
+                st.info("Nenhuma planilha salva no SQLite ainda. Salve uma planilha na aba Relatorio primeiro.")
+            else:
+                stored_df["rotulo"] = stored_df.apply(
+                    lambda r: f"{r['timestamp']} | {r['file_name']} | {r['sheet_name']} | {r['rows']} linhas",
+                    axis=1,
+                )
+                selected_stored = st.selectbox(
+                    "Planilha salva para comparar",
+                    options=stored_df["rotulo"].tolist(),
+                    key=f"compare_stored_{analysis_key}",
+                )
+                selected_id = stored_df.loc[stored_df["rotulo"] == selected_stored, "id"].iloc[0]
+                loaded = load_stored_sheet(selected_id)
+                if loaded is not None:
+                    compare_df, _ = coerce_data_types(loaded)
+                    compare_label = selected_stored.split("|")[1].strip() if "|" in selected_stored else "SQLite"
+
+        if compare_df is not None:
+            comp = compare_dataframes(analysis_df, compare_df, current_name="Atual", other_name=compare_label)
+            st.markdown("**Resumo da comparacao**")
+            st.dataframe(comp["summary_df"], use_container_width=True)
+            chart_df = comp["summary_df"].copy()
+            chart_df["delta_abs"] = pd.to_numeric(chart_df["delta"], errors="coerce").abs()
+            fig_comp = px.bar(chart_df, x="indicador", y="delta", text="delta", title="Diferenca entre base atual e comparacao")
+            fig_comp = apply_analytics_chart_layout(fig_comp, height=360)
+            st.plotly_chart(fig_comp, use_container_width=True, key=f"comparison_delta_{analysis_key}")
+
+            st.markdown("**Leitura automatica da comparacao**")
+            for item in comp["insights"]:
+                st.markdown(f"- {item}")
+
+            c_num, c_cat = st.columns(2)
+            with c_num:
+                st.markdown("**Maiores variacoes numericas**")
+                if len(comp["numeric_df"]) > 0:
+                    st.dataframe(comp["numeric_df"].head(15), use_container_width=True)
+                else:
+                    st.caption("Sem colunas numericas comuns para comparar.")
+            with c_cat:
+                st.markdown("**Mudancas em categorias dominantes**")
+                if len(comp["category_df"]) > 0:
+                    st.dataframe(comp["category_df"].head(15), use_container_width=True)
+                else:
+                    st.caption("Sem colunas categoricas comuns para comparar.")
+
+            comp_excel = generate_comparison_excel(comp)
+            st.download_button(
+                "Baixar Excel da Comparacao",
+                data=comp_excel,
+                file_name=f"comparacao_{Path(uploaded.name).stem}_v{version}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+
+    with tabs[6]:
         st.subheader("Relatorios e Historico")
         st.markdown(f"Versao atual do relatorio: **v{version}**")
         if perms["export"]:
@@ -4446,10 +4932,28 @@ def main() -> None:
                         active_filters=report_filters,
                         area=area,
                     )
+                    try:
+                        pptx_bytes = generate_powerpoint_report(
+                            source_name=uploaded.name,
+                            sheet_name=sheet,
+                            quality_report=quality,
+                            insights=insights,
+                            issue_catalog=issue_catalog,
+                            dashboard_bundle=dashboard_bundle,
+                            treatment_report=treatment_report,
+                            ml_sup=ml_sup,
+                            version=version,
+                        )
+                    except Exception as exc:
+                        pptx_bytes = b""
+                        st.warning(f"PowerPoint nao gerado nesta execucao: {str(exc)[:180]}")
+                    offline_bytes = generate_offline_package()
                     st.session_state.export_cache[export_key] = {
                         "excel_bytes": excel_bytes,
                         "csv_bytes": csv_bytes,
                         "pdf_bytes": pdf_bytes,
+                        "pptx_bytes": pptx_bytes,
+                        "offline_bytes": offline_bytes,
                     }
                     st.success("Exportacoes prontas para download.")
 
@@ -4473,12 +4977,28 @@ def main() -> None:
                 disabled=(export_bundle is None),
             )
             st.download_button(
+                "Baixar Apresentacao PowerPoint Executiva",
+                data=export_bundle.get("pptx_bytes", b"") if export_bundle else b"",
+                file_name=f"apresentacao_{base_name}_{safe_sheet}_v{version}.pptx",
+                mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                use_container_width=True,
+                disabled=(export_bundle is None or not export_bundle.get("pptx_bytes")),
+            )
+            st.download_button(
                 "Baixar CSV de Violacoes",
                 data=export_bundle["csv_bytes"] if export_bundle else b"",
                 file_name=f"violacoes_{base_name}_{safe_sheet}_v{version}.csv",
                 mime="text/csv",
                 use_container_width=True,
                 disabled=(export_bundle is None or len(violations) == 0),
+            )
+            st.download_button(
+                "Baixar Pacote para Instalar Offline",
+                data=export_bundle.get("offline_bytes", b"") if export_bundle else b"",
+                file_name="autoanalista_2026_offline.zip",
+                mime="application/zip",
+                use_container_width=True,
+                disabled=(export_bundle is None),
             )
         else:
             st.info("Perfil viewer sem permissao de exportacao.")
@@ -4489,6 +5009,24 @@ def main() -> None:
         if db_c2.button("Instalar/Inicializar SQLite", use_container_width=True, key=f"install_sqlite_tab_{analysis_key}"):
             migrated = init_local_database(migrate_json=True)
             st.success(f"Banco SQLite pronto. Historico migrado: {migrated} registro(s).")
+        if db_c1.button("Salvar planilha tratada no SQLite", use_container_width=True, key=f"save_sheet_sqlite_{analysis_key}"):
+            if not local_database_installed():
+                init_local_database(migrate_json=True)
+            stored_id = save_sheet_to_local_db(
+                treated_df_export,
+                user=auth["username"],
+                file_name=uploaded.name,
+                sheet_name=sheet,
+                quality_score=quality["score"],
+                version=version,
+                metadata={
+                    "area": area,
+                    "filters": active_filters,
+                    "rows_full_analysis": len(analysis_df),
+                    "saved_limit": MAX_EXPORT_ROWS,
+                },
+            )
+            st.success(f"Planilha salva no banco local SQLite. ID: {stored_id}")
         if role == "admin":
             clear_tab_confirm = db_c3.checkbox("Confirmar limpeza", key=f"confirm_clear_history_tab_{analysis_key}")
             if st.button(
@@ -4509,9 +5047,52 @@ def main() -> None:
         st.markdown("**Historico de analises**")
         hist_df = pd.DataFrame(load_history())
         if len(hist_df) > 0:
-            st.dataframe(hist_df.sort_values("timestamp", ascending=False).head(50), use_container_width=True)
+            hist_view = hist_df.sort_values("timestamp", ascending=False).head(50)
+            st.dataframe(hist_view, use_container_width=True)
+            hist_plot = hist_df.copy()
+            hist_plot["timestamp"] = pd.to_datetime(hist_plot["timestamp"], errors="coerce")
+            hist_plot = hist_plot.dropna(subset=["timestamp"]).sort_values("timestamp")
+            if len(hist_plot) >= 2:
+                h1, h2 = st.columns(2)
+                h1.plotly_chart(
+                    apply_analytics_chart_layout(
+                        px.line(hist_plot, x="timestamp", y="quality_score", markers=True, title="Evolucao do score de qualidade"),
+                        height=340,
+                    ),
+                    use_container_width=True,
+                    key=f"history_quality_{analysis_key}",
+                )
+                h2.plotly_chart(
+                    apply_analytics_chart_layout(
+                        px.bar(hist_plot.tail(20), x="timestamp", y="rows", title="Volume analisado por execucao"),
+                        height=340,
+                    ),
+                    use_container_width=True,
+                    key=f"history_rows_{analysis_key}",
+                )
+                latest_score = float(hist_plot["quality_score"].iloc[-1])
+                prev_score = float(hist_plot["quality_score"].iloc[-2])
+                delta_score = latest_score - prev_score
+                st.caption(f"Historico inteligente: variacao do ultimo score vs execucao anterior = {delta_score:.2f} ponto(s).")
         else:
             st.caption("Sem registros no historico ainda.")
+
+        st.markdown("**Planilhas salvas no SQLite**")
+        stored_df = list_stored_sheets()
+        if len(stored_df) > 0:
+            st.dataframe(stored_df.head(50), use_container_width=True)
+            if role == "admin":
+                confirm_clear_sheets = st.checkbox("Confirmar limpeza das planilhas salvas", key=f"confirm_clear_stored_sheets_{analysis_key}")
+                if st.button(
+                    "Limpar planilhas salvas no SQLite",
+                    use_container_width=True,
+                    key=f"clear_stored_sheets_{analysis_key}",
+                    disabled=not confirm_clear_sheets,
+                ):
+                    clear_stored_sheets()
+                    st.success("Planilhas salvas removidas do SQLite.")
+        else:
+            st.caption("Nenhuma planilha salva no banco local ainda.")
 
 
 if __name__ == "__main__":
