@@ -2061,6 +2061,15 @@ def format_kpi_metric(item: dict) -> str:
     return f"{value:.2f}"
 
 
+def format_br_number(value: object, decimals: int = 2) -> str:
+    try:
+        num = float(value)
+    except Exception:
+        return clean_report_text(value, 80)
+    formatted = f"{num:,.{decimals}f}"
+    return formatted.replace(",", "X").replace(".", ",").replace("X", ".")
+
+
 def apply_inline_filters(
     df: pd.DataFrame,
     groups: dict[str, List[str]],
@@ -3495,7 +3504,10 @@ def compare_dataframes(current_df: pd.DataFrame, other_df: pd.DataFrame, current
     common_cols = [c for c in current_df.columns if c in other_df.columns]
     new_cols = [c for c in current_df.columns if c not in other_df.columns]
     removed_cols = [c for c in other_df.columns if c not in current_df.columns]
-    common_numeric = [c for c in common_cols if c in current_groups["numeric"] and c in other_groups["numeric"]]
+    current_metric_numeric, current_ids = select_numeric_metric_columns(current_df, current_groups)
+    other_metric_numeric, other_ids = select_numeric_metric_columns(other_df, other_groups)
+    id_like = set(current_ids + other_ids)
+    common_numeric = [c for c in common_cols if c in current_metric_numeric and c in other_metric_numeric]
     common_categorical = [c for c in common_cols if c in current_groups["categorical"] and c in other_groups["categorical"]]
 
     summary_df = pd.DataFrame(
@@ -3529,23 +3541,34 @@ def compare_dataframes(current_df: pd.DataFrame, other_df: pd.DataFrame, current
         oth = pd.to_numeric(other_df[col], errors="coerce")
         cur_sum, oth_sum = float(cur.sum(skipna=True)), float(oth.sum(skipna=True))
         cur_mean, oth_mean = float(cur.mean(skipna=True)), float(oth.mean(skipna=True))
+        cur_median, oth_median = float(cur.median(skipna=True)), float(oth.median(skipna=True))
+        delta_sum = cur_sum - oth_sum
+        delta_sum_pct = (delta_sum / abs(oth_sum) * 100.0) if abs(oth_sum) > 1e-9 else None
         numeric_rows.append(
             {
                 "coluna": col,
                 f"soma_{current_name}": cur_sum,
                 f"soma_{other_name}": oth_sum,
-                "delta_soma": cur_sum - oth_sum,
+                "delta_soma": delta_sum,
+                "delta_soma_pct": round(delta_sum_pct, 2) if delta_sum_pct is not None else None,
                 f"media_{current_name}": cur_mean,
                 f"media_{other_name}": oth_mean,
                 "delta_media": cur_mean - oth_mean,
+                f"mediana_{current_name}": cur_median,
+                f"mediana_{other_name}": oth_median,
+                "delta_mediana": cur_median - oth_median,
             }
         )
     numeric_df = pd.DataFrame(numeric_rows).sort_values("delta_soma", key=lambda s: s.abs(), ascending=False) if numeric_rows else pd.DataFrame()
 
     category_rows = []
-    for col in common_categorical[:8]:
-        cur_top = current_df[col].fillna("NULO").astype(str).value_counts(normalize=True).head(1)
-        oth_top = other_df[col].fillna("NULO").astype(str).value_counts(normalize=True).head(1)
+    category_delta_rows = []
+    ranking_rows = []
+    for col in common_categorical[:12]:
+        cur_counts = current_df[col].fillna("NULO").astype(str).value_counts()
+        oth_counts = other_df[col].fillna("NULO").astype(str).value_counts()
+        cur_top = cur_counts.div(max(len(current_df), 1)).head(1)
+        oth_top = oth_counts.div(max(len(other_df), 1)).head(1)
         if len(cur_top) == 0 or len(oth_top) == 0:
             continue
         category_rows.append(
@@ -3555,38 +3578,167 @@ def compare_dataframes(current_df: pd.DataFrame, other_df: pd.DataFrame, current
                 f"participacao_{current_name}_pct": round(float(cur_top.iloc[0]) * 100, 2),
                 f"top_{other_name}": oth_top.index[0],
                 f"participacao_{other_name}_pct": round(float(oth_top.iloc[0]) * 100, 2),
+                "mudou_lider": cur_top.index[0] != oth_top.index[0],
             }
         )
+        all_cats = sorted(set(cur_counts.index).union(set(oth_counts.index)))
+        for cat in all_cats:
+            cur_qtd = int(cur_counts.get(cat, 0))
+            oth_qtd = int(oth_counts.get(cat, 0))
+            cur_share = cur_qtd / max(len(current_df), 1) * 100.0
+            oth_share = oth_qtd / max(len(other_df), 1) * 100.0
+            delta_qtd = cur_qtd - oth_qtd
+            delta_pct = (delta_qtd / abs(oth_qtd) * 100.0) if oth_qtd else None
+            category_delta_rows.append(
+                {
+                    "coluna": col,
+                    "categoria": cat,
+                    f"qtd_{current_name}": cur_qtd,
+                    f"qtd_{other_name}": oth_qtd,
+                    "delta_qtd": delta_qtd,
+                    "delta_pct": round(delta_pct, 2) if delta_pct is not None else None,
+                    f"participacao_{current_name}_pct": round(cur_share, 2),
+                    f"participacao_{other_name}_pct": round(oth_share, 2),
+                    "delta_participacao_pct": round(cur_share - oth_share, 2),
+                    "status_mudanca": "nova" if oth_qtd == 0 and cur_qtd > 0 else "desapareceu" if cur_qtd == 0 and oth_qtd > 0 else "permanece",
+                }
+            )
+        cur_rank = {cat: i + 1 for i, cat in enumerate(cur_counts.head(10).index)}
+        oth_rank = {cat: i + 1 for i, cat in enumerate(oth_counts.head(10).index)}
+        for cat in sorted(set(cur_rank).union(oth_rank)):
+            ranking_rows.append(
+                {
+                    "coluna": col,
+                    "categoria": cat,
+                    f"ranking_{current_name}": cur_rank.get(cat),
+                    f"ranking_{other_name}": oth_rank.get(cat),
+                    "mudanca_ranking": (oth_rank.get(cat, 99) - cur_rank.get(cat, 99)),
+                    "entrou_top10": cat in cur_rank and cat not in oth_rank,
+                    "saiu_top10": cat in oth_rank and cat not in cur_rank,
+                }
+            )
     category_df = pd.DataFrame(category_rows)
+    category_delta_df = (
+        pd.DataFrame(category_delta_rows).sort_values("delta_qtd", key=lambda s: s.abs(), ascending=False)
+        if category_delta_rows
+        else pd.DataFrame()
+    )
+    ranking_df = (
+        pd.DataFrame(ranking_rows).sort_values(["entrou_top10", "saiu_top10", "mudanca_ranking"], ascending=[False, False, False])
+        if ranking_rows
+        else pd.DataFrame()
+    )
+
+    current_volume_col = pick_volume_id_column(current_df, current_ids)
+    other_volume_col = current_volume_col if current_volume_col in other_df.columns else pick_volume_id_column(other_df, other_ids)
+    current_volume = int(current_df[current_volume_col].nunique(dropna=True)) if current_volume_col else int(len(current_df))
+    other_volume = int(other_df[other_volume_col].nunique(dropna=True)) if other_volume_col else int(len(other_df))
+    volume_delta = current_volume - other_volume
+    volume_delta_pct = (volume_delta / abs(other_volume) * 100.0) if other_volume else None
+    volume_df = pd.DataFrame(
+        [
+            {
+                "indicador": f"Volume por {'ID ' + current_volume_col if current_volume_col else 'linhas'}",
+                current_name: current_volume,
+                other_name: other_volume,
+                "delta": volume_delta,
+                "delta_pct": round(volume_delta_pct, 2) if volume_delta_pct is not None else None,
+            }
+        ]
+    )
 
     insights = []
-    row_delta = len(current_df) - len(other_df)
-    if row_delta != 0:
-        direction = "aumentou" if row_delta > 0 else "reduziu"
-        insights.append(f"O volume de linhas {direction} em {abs(row_delta):,} registro(s).".replace(",", "."))
+    if volume_delta != 0:
+        direction = "aumentou" if volume_delta > 0 else "reduziu"
+        pct_txt = f" ({abs(volume_delta_pct):.1f}%)" if volume_delta_pct is not None else ""
+        insights.append(f"O volume analisado {direction} em {abs(volume_delta):,} registro(s){pct_txt}.".replace(",", "."))
     score_delta = current_quality["score"] - other_quality["score"]
     if abs(score_delta) >= 5:
         direction = "melhorou" if score_delta > 0 else "piorou"
         insights.append(f"O score de qualidade {direction} {abs(score_delta):.1f} ponto(s).")
+    if len(category_delta_df) > 0:
+        top_change = category_delta_df.iloc[0]
+        direction = "cresceu" if int(top_change["delta_qtd"]) > 0 else "reduziu"
+        insights.append(
+            f"A maior mudanca de perfil ocorreu em `{top_change['coluna']}` = `{top_change['categoria']}`: {direction} {abs(int(top_change['delta_qtd']))} registro(s)."
+        )
+    if len(category_df) > 0 and bool(category_df["mudou_lider"].any()):
+        changed = category_df[category_df["mudou_lider"]].iloc[0]
+        insights.append(
+            f"A lideranca mudou em `{changed['coluna']}`: antes `{changed[f'top_{other_name}']}`, agora `{changed[f'top_{current_name}']}`."
+        )
     if new_cols:
         insights.append("Novas colunas na base atual: " + ", ".join(new_cols[:5]) + ".")
     if removed_cols:
         insights.append("Colunas ausentes na base atual: " + ", ".join(removed_cols[:5]) + ".")
     if len(numeric_df) > 0:
         row = numeric_df.iloc[0]
-        insights.append(f"Maior variacao numerica em `{row['coluna']}`: delta de soma {float(row['delta_soma']):,.2f}.".replace(",", "."))
+        insights.append(f"Maior variacao numerica em `{row['coluna']}`: delta de soma {format_br_number(row['delta_soma'])}.")
     if not insights:
         insights.append("As bases comparadas apresentam variacao baixa nos principais indicadores automaticos.")
 
+    alerts = []
+    if volume_delta_pct is not None and abs(volume_delta_pct) >= 20:
+        alerts.append(
+            {
+                "prioridade": "P1",
+                "alerta": "Variacao relevante de volume",
+                "evidencia": f"Delta de {volume_delta} registro(s), {volume_delta_pct:.1f}%.",
+                "impacto": "Pode indicar mudanca operacional, recorte diferente ou evolucao real da demanda.",
+                "acao": "Validar periodo, filtros e causa operacional da variacao.",
+            }
+        )
+    if len(category_delta_df) > 0:
+        material = category_delta_df[
+            (category_delta_df["delta_participacao_pct"].abs() >= 10)
+            | (category_delta_df["status_mudanca"].isin(["nova", "desapareceu"]))
+        ].head(5)
+        for _, row in material.iterrows():
+            alerts.append(
+                {
+                    "prioridade": "P1" if abs(float(row["delta_participacao_pct"])) >= 20 else "P2",
+                    "alerta": "Mudanca de perfil por categoria",
+                    "evidencia": f"{row['coluna']}={row['categoria']} | delta participacao {row['delta_participacao_pct']:.1f}%.",
+                    "impacto": "Pode alterar prioridade gerencial e distribuicao de recursos.",
+                    "acao": "Investigar causa da mudanca e revisar plano de atendimento/operacao.",
+                }
+            )
+    if abs(score_delta) >= 5:
+        alerts.append(
+            {
+                "prioridade": "P1" if score_delta < 0 else "P2",
+                "alerta": "Mudanca no score de qualidade",
+                "evidencia": f"Delta de qualidade {score_delta:.1f} ponto(s).",
+                "impacto": "Afeta confiabilidade da leitura e das decisoes baseadas na planilha.",
+                "acao": "Revisar ausencias, duplicidades, tipos mistos e regras de qualidade.",
+            }
+        )
+    action_df = pd.DataFrame(alerts[:8]) if alerts else pd.DataFrame(
+        [
+            {
+                "prioridade": "P3",
+                "alerta": "Sem mudanca critica detectada",
+                "evidencia": "A comparacao automatica nao identificou variacoes materiais.",
+                "impacto": "Manter acompanhamento recorrente.",
+                "acao": "Repetir comparacao no proximo ciclo e monitorar indicadores-chave.",
+            }
+        ]
+    )
+
     return {
         "summary_df": summary_df,
+        "volume_df": volume_df,
         "numeric_df": numeric_df,
         "category_df": category_df,
+        "category_delta_df": category_delta_df,
+        "ranking_df": ranking_df,
+        "action_df": action_df,
         "insights": insights,
         "new_cols": new_cols,
         "removed_cols": removed_cols,
         "current_quality": current_quality,
         "other_quality": other_quality,
+        "id_like_cols": sorted(id_like),
     }
 
 
@@ -3594,10 +3746,16 @@ def generate_comparison_excel(comparison: dict) -> bytes:
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
         comparison["summary_df"].to_excel(writer, sheet_name="resumo", index=False)
+        comparison.get("volume_df", pd.DataFrame()).to_excel(writer, sheet_name="volume", index=False)
         if len(comparison["numeric_df"]) > 0:
             comparison["numeric_df"].to_excel(writer, sheet_name="numericas", index=False)
         if len(comparison["category_df"]) > 0:
             comparison["category_df"].to_excel(writer, sheet_name="categorias", index=False)
+        if len(comparison.get("category_delta_df", pd.DataFrame())) > 0:
+            comparison["category_delta_df"].to_excel(writer, sheet_name="mudancas_categoria", index=False)
+        if len(comparison.get("ranking_df", pd.DataFrame())) > 0:
+            comparison["ranking_df"].to_excel(writer, sheet_name="ranking", index=False)
+        comparison.get("action_df", pd.DataFrame()).to_excel(writer, sheet_name="plano_acao", index=False)
         pd.DataFrame({"insight": comparison["insights"]}).to_excel(writer, sheet_name="insights", index=False)
         pd.DataFrame({"colunas_novas": comparison["new_cols"]}).to_excel(writer, sheet_name="colunas_novas", index=False)
         pd.DataFrame({"colunas_removidas": comparison["removed_cols"]}).to_excel(writer, sheet_name="colunas_removidas", index=False)
@@ -4858,31 +5016,79 @@ def main() -> None:
 
         if compare_df is not None:
             comp = compare_dataframes(analysis_df, compare_df, current_name="Atual", other_name=compare_label)
-            st.markdown("**Resumo da comparacao**")
-            st.dataframe(comp["summary_df"], use_container_width=True)
-            chart_df = comp["summary_df"].copy()
-            chart_df["delta_abs"] = pd.to_numeric(chart_df["delta"], errors="coerce").abs()
-            fig_comp = px.bar(chart_df, x="indicador", y="delta", text="delta", title="Diferenca entre base atual e comparacao")
-            fig_comp = apply_analytics_chart_layout(fig_comp, height=360)
-            st.plotly_chart(fig_comp, use_container_width=True, key=f"comparison_delta_{analysis_key}")
+            st.markdown("### Resumo Executivo")
+            vol = comp["volume_df"].iloc[0] if len(comp["volume_df"]) else {}
+            score_delta = float(comp["summary_df"].loc[comp["summary_df"]["indicador"] == "Score qualidade", "delta"].iloc[0])
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Volume atual", f"{int(vol.get('Atual', len(analysis_df))):,}".replace(",", "."), delta=f"{int(vol.get('delta', 0)):,}".replace(",", "."))
+            c2.metric("Delta volume %", f"{float(vol.get('delta_pct', 0) or 0):.1f}%")
+            c3.metric("Delta qualidade", f"{score_delta:.1f} pts")
+            c4.metric("Alertas gerenciais", int(len(comp["action_df"])))
 
-            st.markdown("**Leitura automatica da comparacao**")
             for item in comp["insights"]:
                 st.markdown(f"- {item}")
 
-            c_num, c_cat = st.columns(2)
-            with c_num:
-                st.markdown("**Maiores variacoes numericas**")
-                if len(comp["numeric_df"]) > 0:
-                    st.dataframe(comp["numeric_df"].head(15), use_container_width=True)
+            st.markdown("### Mudancas Relevantes")
+            delta_df = comp.get("category_delta_df", pd.DataFrame())
+            ranking_df = comp.get("ranking_df", pd.DataFrame())
+            m1, m2 = st.columns(2)
+            with m1:
+                st.markdown("**Maiores altas e quedas por categoria**")
+                if len(delta_df) > 0:
+                    st.dataframe(delta_df.head(15), use_container_width=True)
                 else:
-                    st.caption("Sem colunas numericas comuns para comparar.")
-            with c_cat:
-                st.markdown("**Mudancas em categorias dominantes**")
-                if len(comp["category_df"]) > 0:
-                    st.dataframe(comp["category_df"].head(15), use_container_width=True)
+                    st.caption("Sem categorias comuns suficientes para detectar mudancas de perfil.")
+            with m2:
+                st.markdown("**Entradas, saidas e mudancas no ranking**")
+                if len(ranking_df) > 0:
+                    st.dataframe(ranking_df.head(15), use_container_width=True)
                 else:
-                    st.caption("Sem colunas categoricas comuns para comparar.")
+                    st.caption("Sem ranking categorico comparavel.")
+
+            st.markdown("### Graficos Comparativos")
+            chart_df = comp["summary_df"].copy()
+            chart_df["delta_abs"] = pd.to_numeric(chart_df["delta"], errors="coerce").abs()
+            g1, g2 = st.columns(2)
+            fig_comp = px.bar(chart_df, x="indicador", y="delta", text="delta", title="Deltas executivos")
+            fig_comp = apply_analytics_chart_layout(fig_comp, height=360)
+            g1.plotly_chart(fig_comp, use_container_width=True, key=f"comparison_delta_{analysis_key}")
+
+            if len(delta_df) > 0:
+                top_delta = delta_df.head(12).copy()
+                top_delta["rotulo"] = top_delta["coluna"].astype(str) + " | " + top_delta["categoria"].astype(str)
+                fig_cat_delta = px.bar(
+                    top_delta,
+                    x="delta_qtd",
+                    y="rotulo",
+                    orientation="h",
+                    text="delta_qtd",
+                    title="Maiores mudancas de perfil",
+                    color="delta_participacao_pct",
+                    color_continuous_scale=["#DC2626", "#F8FAFC", "#16A34A"],
+                )
+                fig_cat_delta = apply_analytics_chart_layout(fig_cat_delta, height=420)
+                g2.plotly_chart(fig_cat_delta, use_container_width=True, key=f"comparison_cat_delta_{analysis_key}")
+            else:
+                g2.info("Sem deltas categoricos para graficos.")
+
+            if len(comp["numeric_df"]) > 0:
+                st.markdown("**Variacao de metricas numericas reais**")
+                num_chart = comp["numeric_df"].head(12).copy()
+                fig_num = px.bar(
+                    num_chart,
+                    x="coluna",
+                    y="delta_soma",
+                    text="delta_soma",
+                    title="Delta de soma por metrica",
+                    color="delta_soma",
+                    color_continuous_scale=["#DC2626", "#F8FAFC", "#16A34A"],
+                )
+                fig_num = apply_analytics_chart_layout(fig_num, height=380)
+                st.plotly_chart(fig_num, use_container_width=True, key=f"comparison_numeric_delta_{analysis_key}")
+                st.dataframe(comp["numeric_df"].head(15), use_container_width=True)
+
+            st.markdown("### Plano de Acao")
+            st.dataframe(comp["action_df"], use_container_width=True)
 
             comp_excel = generate_comparison_excel(comp)
             st.download_button(
