@@ -664,6 +664,25 @@ def render_database_controls(role: str) -> None:
         st.sidebar.caption("Limpeza disponivel apenas para perfil admin.")
 
 
+def render_offline_install_controls() -> None:
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("Instalacao offline")
+    st.sidebar.caption("Baixe um pacote ZIP para rodar o AutoAnalista no computador local, usando SQLite proprio.")
+    try:
+        offline_bytes = generate_offline_package()
+        st.sidebar.download_button(
+            "Baixar app offline",
+            data=offline_bytes,
+            file_name="autoanalista_2026_offline.zip",
+            mime="application/zip",
+            use_container_width=True,
+            key="download_offline_sidebar",
+        )
+        st.sidebar.caption("Depois de extrair, execute `INICIAR_AUTOANALISTA.bat`.")
+    except Exception as exc:
+        st.sidebar.warning(f"Pacote offline indisponivel agora: {str(exc)[:120]}")
+
+
 def login_panel() -> Optional[dict]:
     st.sidebar.subheader("Acesso")
     users, demo_mode = load_auth_users()
@@ -4331,6 +4350,7 @@ def main() -> None:
         key="business_area_selector",
     )
     render_database_controls(role)
+    render_offline_install_controls()
 
     st.title("AutoAnalista de Dados 2026")
     st.caption("Analista profissional com qualidade, insights executivos, ML explicavel e governanca de historico.")
@@ -4338,6 +4358,9 @@ def main() -> None:
 
     uploaded = st.file_uploader("Envie sua planilha", type=SUPPORTED_TYPES, key="uploaded_sheet")
     if uploaded is None:
+        st.subheader("Instalacao local/offline")
+        st.info("Para rodar o AutoAnalista no proprio computador, use o botao `Baixar app offline` no menu lateral.")
+        st.caption("O pacote inclui app, dependencias, inicializador Windows e instrucoes. O banco SQLite fica local no computador instalado.")
         hist = load_history()
         if hist:
             st.subheader("Historico recente")
