@@ -8,6 +8,8 @@ import os
 import re
 import sqlite3
 import unicodedata
+import urllib.error
+import urllib.request
 import zipfile
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -635,6 +637,252 @@ def apply_theme(theme_mode: str) -> None:
             """,
             unsafe_allow_html=True,
         )
+
+
+def get_secret_value(name: str) -> str:
+    try:
+        value = st.secrets.get(name, "")
+        return str(value) if value else ""
+    except Exception:
+        return os.getenv(name, "")
+
+
+def render_turbo_ai_controls() -> dict:
+    secret_key_available = bool(get_secret_value("OPENAI_API_KEY"))
+    st.sidebar.markdown(
+        """
+        <style>
+        .turbo-api-card {
+            margin: 10px 0 12px 0;
+            padding: 13px 14px;
+            border: 1px solid rgba(56, 189, 248, 0.45);
+            border-radius: 14px;
+            background:
+                radial-gradient(circle at top left, rgba(14, 165, 233, 0.24), transparent 42%),
+                linear-gradient(135deg, rgba(15, 23, 42, 0.92), rgba(8, 47, 73, 0.86));
+            box-shadow: 0 0 0 1px rgba(125, 211, 252, 0.08), 0 14px 30px rgba(2, 8, 23, 0.28);
+        }
+        .turbo-api-title {
+            font-size: 18px;
+            font-weight: 900;
+            letter-spacing: .3px;
+            color: #E0F2FE;
+        }
+        .turbo-api-cta {
+            margin-top: 8px;
+            font-size: 15px;
+            font-weight: 900;
+            color: #FACC15;
+            text-transform: uppercase;
+            letter-spacing: .7px;
+            text-shadow: 0 0 12px rgba(250, 204, 21, .35);
+        }
+        .turbo-api-note {
+            margin-top: 6px;
+            font-size: 12px;
+            color: #BAE6FD;
+        }
+        </style>
+        <div class="turbo-api-card">
+            <div class="turbo-api-title">Modo Turbo IA</div>
+            <div class="turbo-api-note">Opcional: o app continua funcionando sem API.</div>
+            <div class="turbo-api-cta">Ativar modo turbo com API</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    api_key = st.sidebar.text_input(
+        "Chave API",
+        type="password",
+        value="",
+        placeholder="Cole sua API key aqui",
+        key="turbo_api_key",
+        help="A chave fica apenas na sessao atual e nao e salva no banco, historico ou relatorios.",
+    )
+    use_secret = False
+    if secret_key_available and not api_key:
+        use_secret = st.sidebar.checkbox("Usar chave configurada no Streamlit Secrets", value=True, key="turbo_use_secret")
+    enabled = st.sidebar.checkbox("Ativar Modo Turbo", value=False, key="turbo_enabled")
+    with st.sidebar.expander("Configuracao avancada do Turbo", expanded=False):
+        model = st.text_input("Modelo", value="gpt-4o-mini", key="turbo_model")
+        base_url = st.text_input("Endpoint", value="https://api.openai.com/v1", key="turbo_base_url")
+        st.caption("Use endpoint compativel com `/chat/completions`.")
+
+    selected_key = api_key.strip() or (get_secret_value("OPENAI_API_KEY") if use_secret else "")
+    active = bool(enabled and selected_key)
+    if enabled and not selected_key:
+        st.sidebar.warning("Modo Turbo marcado, mas nenhuma chave API foi informada.")
+    elif active:
+        st.sidebar.success("Modo Turbo ativo. A IA sera usada sob demanda.")
+    else:
+        st.sidebar.caption("Modo Turbo desligado. Analises locais continuam ativas.")
+
+    return {
+        "enabled": active,
+        "api_key": selected_key,
+        "model": model.strip() or "gpt-4o-mini",
+        "base_url": base_url.strip().rstrip("/") or "https://api.openai.com/v1",
+    }
+
+
+def turbo_ai_available(turbo_config: Optional[dict]) -> bool:
+    return bool(turbo_config and turbo_config.get("enabled") and turbo_config.get("api_key"))
+
+
+def call_turbo_ai(
+    turbo_config: Optional[dict],
+    *,
+    section: str,
+    context: dict,
+    instruction: str,
+    max_tokens: int = 750,
+) -> Tuple[bool, str]:
+    if not turbo_ai_available(turbo_config):
+        return False, "Modo Turbo nao esta ativo. Informe uma chave API e ative o modo turbo na sidebar."
+
+    payload = {
+        "model": turbo_config.get("model", "gpt-4o-mini"),
+        "temperature": 0.2,
+        "max_tokens": max_tokens,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "Voce e um analista de dados senior em 2026, especialista em qualidade, gestao, "
+                    "dashboard executivo e leitura de planilhas. Responda em portugues do Brasil, "
+                    "com objetividade, sem inventar numeros que nao estejam no contexto."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Secao: {section}\n"
+                    f"Instrucao: {instruction}\n\n"
+                    "Contexto agregado da analise (sem dados brutos completos):\n"
+                    f"{json.dumps(context, ensure_ascii=False, default=str)[:14000]}"
+                ),
+            },
+        ],
+    }
+    url = f"{str(turbo_config.get('base_url', 'https://api.openai.com/v1')).rstrip('/')}/chat/completions"
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {turbo_config.get('api_key')}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=45) as response:
+            result = json.loads(response.read().decode("utf-8"))
+        text = result.get("choices", [{}])[0].get("message", {}).get("content", "")
+        return True, text.strip() or "A API respondeu sem texto utilizavel."
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="ignore")[:500]
+        return False, f"Falha na API ({exc.code}). {detail}"
+    except Exception as exc:
+        return False, f"Nao foi possivel acionar o Modo Turbo: {str(exc)[:500]}"
+
+
+def compact_records(df: pd.DataFrame, limit: int = 8) -> List[dict]:
+    if df is None or len(df) == 0:
+        return []
+    return df.head(limit).astype(object).where(pd.notna(df.head(limit)), None).to_dict("records")
+
+
+def build_ai_dataset_context(
+    df: pd.DataFrame,
+    groups: dict[str, List[str]],
+    quality_report: Optional[dict] = None,
+    profile: Optional[dict] = None,
+    kpis: Optional[List[dict]] = None,
+    issue_catalog: Optional[pd.DataFrame] = None,
+    active_filters: Optional[List[str]] = None,
+) -> dict:
+    metric_numeric, id_like_cols = select_numeric_metric_columns(df, groups)
+    volume_col = pick_volume_id_column(df, id_like_cols)
+    profile = profile or detect_spreadsheet_profile(df, groups, quality_report or {})
+    top_categories = []
+    for col in groups.get("categorical", [])[:6]:
+        vc = df[col].fillna("NULO").astype(str).value_counts().head(8)
+        top_categories.append(
+            {
+                "coluna": col,
+                "valores": [
+                    {"categoria": str(idx), "quantidade": int(val), "participacao_pct": round(float(val) / max(len(df), 1) * 100, 2)}
+                    for idx, val in vc.items()
+                ],
+            }
+        )
+    numeric_summary = []
+    for col in metric_numeric[:8]:
+        s = pd.to_numeric(df[col], errors="coerce").dropna()
+        if len(s) == 0:
+            continue
+        numeric_summary.append(
+            {
+                "coluna": col,
+                "media": float(s.mean()),
+                "mediana": float(s.median()),
+                "min": float(s.min()),
+                "max": float(s.max()),
+                "n_validos": int(len(s)),
+            }
+        )
+    issues = compact_records(issue_catalog.sort_values(["priority_rank", "affected_rows"], ascending=[True, False]), 8) if issue_catalog is not None and len(issue_catalog) > 0 else []
+    return {
+        "linhas": int(len(df)),
+        "colunas": int(df.shape[1]),
+        "grupos_colunas": {k: v[:20] for k, v in groups.items()},
+        "metricas_numericas_validas": metric_numeric[:15],
+        "colunas_id_codigo": id_like_cols[:15],
+        "coluna_volume": volume_col,
+        "perfil_detectado": {
+            "tipo": profile.get("tipo"),
+            "confianca": profile.get("confianca"),
+            "melhor_analise": profile.get("melhor_analise"),
+            "graficos_recomendados": profile.get("graficos_recomendados", [])[:8],
+        },
+        "qualidade": {
+            "score": quality_report.get("score") if quality_report else None,
+            "nivel": quality_report.get("level") if quality_report else None,
+            "ausencia_pct": round(float(quality_report.get("missing_ratio", 0.0)) * 100, 2) if quality_report else None,
+            "duplicadas": quality_report.get("duplicates") if quality_report else None,
+        },
+        "kpis": [{k: v for k, v in item.items() if k != "comparison"} for item in (kpis or [])[:6]],
+        "top_categorias": top_categories,
+        "resumo_numerico": numeric_summary,
+        "principais_riscos": issues,
+        "filtros_ativos": active_filters or [],
+    }
+
+
+def render_turbo_ai_box(
+    *,
+    turbo_config: Optional[dict],
+    section: str,
+    button_label: str,
+    context: dict,
+    instruction: str,
+    cache_key: str,
+) -> None:
+    st.markdown("**Modo Turbo IA**")
+    if not turbo_ai_available(turbo_config):
+        st.info("Opcional: informe uma chave API na sidebar e ative o Modo Turbo para receber uma leitura analitica por IA.")
+        return
+    if st.button(button_label, use_container_width=True, key=f"turbo_btn_{cache_key}"):
+        with st.spinner("Modo Turbo analisando os dados agregados..."):
+            ok, text = call_turbo_ai(turbo_config, section=section, context=context, instruction=instruction)
+        st.session_state[f"turbo_result_{cache_key}"] = {"ok": ok, "text": text}
+    result = st.session_state.get(f"turbo_result_{cache_key}")
+    if result:
+        if result.get("ok"):
+            st.success("Analise Turbo gerada.")
+            st.markdown(result.get("text", ""))
+        else:
+            st.error(result.get("text", "Falha ao gerar analise Turbo."))
 
 
 def render_database_controls(role: str) -> None:
@@ -3307,6 +3555,7 @@ def render_management_dashboard(
     violations: pd.DataFrame,
     *,
     key_prefix: str = "dash",
+    turbo_config: Optional[dict] = None,
 ) -> None:
     st.subheader("Dashboard Gerencial")
 
@@ -3357,6 +3606,27 @@ def render_management_dashboard(
     )
     for note in dashboard_notes:
         st.markdown(f"- {note}")
+
+    render_turbo_ai_box(
+        turbo_config=turbo_config,
+        section="Dashboard",
+        button_label="Gerar leitura Turbo do Dashboard",
+        context=build_ai_dataset_context(
+            dashboard_df,
+            dash_groups,
+            quality_report=quality_report,
+            profile=spreadsheet_profile,
+            kpis=dash_kpis,
+            issue_catalog=issue_catalog,
+            active_filters=dashboard_filters,
+        ),
+        instruction=(
+            "Explique para a gerencia o que esta acontecendo no dashboard. "
+            "Destaque riscos, oportunidades, gargalos, leituras dos graficos recomendados e proximas acoes. "
+            "Quando houver IDs/codigos, reforce que devem ser contados, nao somados."
+        ),
+        cache_key=f"{key_prefix}_dashboard_{hash_text('|'.join(dashboard_filters))[:8]}",
+    )
 
     if dash_kpis:
         st.markdown("**KPI board executivo**")
@@ -5428,6 +5698,7 @@ def build_pdf_report(
 def main() -> None:
     ensure_data_storage()
     st.sidebar.title("AutoAnalista 2026")
+    turbo_config = render_turbo_ai_controls()
     st.sidebar.caption(f"Criador do app: {CREATOR_SIGNATURE}")
     theme = st.sidebar.selectbox("Tema visual", options=["Escuro", "Claro"], index=0, key="theme_selector")
     apply_theme(theme)
@@ -5748,6 +6019,7 @@ def main() -> None:
             treatment_report,
             violations,
             key_prefix=f"dash_{analysis_key}",
+            turbo_config=turbo_config,
         )
 
     with tabs[2]:
@@ -5808,6 +6080,28 @@ def main() -> None:
             st.markdown("**Insights claros do recorte filtrado**")
             for i in insights_notes:
                 st.markdown(f"- {i}")
+
+            render_turbo_ai_box(
+                turbo_config=turbo_config,
+                section="Insights",
+                button_label="Gerar Insights Turbo com IA",
+                context=build_ai_dataset_context(
+                    insights_df,
+                    insights_groups,
+                    quality_report=insights_quality,
+                    profile=insights_profile,
+                    kpis=insights_kpis,
+                    issue_catalog=insights_issue_catalog,
+                    active_filters=insight_filters,
+                ),
+                instruction=(
+                    "Transforme os dados filtrados em uma leitura analitica clara. "
+                    "Separe: resumo do recorte, principais concentracoes, alertas, hipoteses de causa, "
+                    "o que investigar primeiro e sugestao de graficos/indicadores. "
+                    "Evite somar IDs/codigos; use contagem quando o campo representar unidade, chamado, ticket ou protocolo."
+                ),
+                cache_key=f"insights_{analysis_key}_{hash_text('|'.join(insight_filters))[:10]}",
+            )
 
             st.markdown("**KPIs detectados automaticamente**")
             if insights_kpis:
@@ -5965,6 +6259,31 @@ def main() -> None:
                 if ml_sup.get("model_comparison"):
                     st.markdown("**Comparacao dos modelos avaliados**")
                     st.dataframe(pd.DataFrame(ml_sup["model_comparison"]), use_container_width=True)
+
+                ml_context = build_ai_dataset_context(
+                    analysis_df,
+                    groups,
+                    quality_report=quality,
+                    profile=detect_spreadsheet_profile(analysis_df, groups, quality),
+                    kpis=kpis,
+                    issue_catalog=issue_catalog,
+                    active_filters=active_filters,
+                )
+                ml_context["resultado_ml"] = public_ml_summary(ml_sup)
+                ml_context["resultado_ml_sem_alvo"] = ml_unsup or {}
+                render_turbo_ai_box(
+                    turbo_config=turbo_config,
+                    section="Machine Learning",
+                    button_label="Gerar explicacao Turbo do ML",
+                    context=ml_context,
+                    instruction=(
+                        "Explique o resultado do Machine Learning para um gestor. "
+                        "Inclua: objetivo do modelo, metrica principal, confiabilidade, variaveis mais relevantes, "
+                        "riscos de uso, proximos testes recomendados e como aplicar o resultado na operacao. "
+                        "Se a metrica for fraca, deixe isso claro sem mascarar o risco."
+                    ),
+                    cache_key=f"ml_{analysis_key}_{predictive_target_col}_{model_key_suffix}",
+                )
 
                 if ml_sup.get("problem_type") == "classification" and ml_sup.get("confusion_matrix"):
                     st.markdown("**Matriz de confusao salva do holdout**")
