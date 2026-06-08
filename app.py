@@ -2597,6 +2597,184 @@ def category_reading(dist: pd.DataFrame, cat_col: str) -> List[str]:
     return bullets
 
 
+def default_aggregation_for_profile(profile: Optional[dict], metric_col: Optional[str] = None) -> str:
+    tipo = normalize_token_text((profile or {}).get("tipo", ""))
+    metric_key = normalize_token_text(metric_col or "")
+    sum_domains = ["financeiro", "faturamento", "cobranca", "vendas", "comercial", "estoque", "inventario"]
+    sum_metrics = ["valor", "receita", "custo", "despesa", "saldo", "liquido", "bruto", "imposto", "quantidade", "qtd"]
+    if any(token in tipo for token in sum_domains) and any(token in metric_key for token in sum_metrics):
+        return "Soma"
+    return "Contagem"
+
+
+def choose_secondary_category(df: pd.DataFrame, groups: dict[str, List[str]], primary_col: Optional[str]) -> Optional[str]:
+    candidates = []
+    id_like = set(detect_id_like_columns(df))
+    for col in groups.get("categorical", []):
+        if col == primary_col or col in id_like:
+            continue
+        non_null = df[col].dropna()
+        if len(non_null) == 0:
+            continue
+        unique_count = int(non_null.nunique(dropna=True))
+        if 2 <= unique_count <= 20:
+            candidates.append((score_column_by_tokens(col, ["status", "motivo", "cidade", "canal", "tipo", "categoria", "prioridade", "area"]), len(non_null), -unique_count, col))
+    if not candidates:
+        return None
+    return sorted(candidates, reverse=True)[0][-1]
+
+
+def render_category_cross_analysis(
+    df: pd.DataFrame,
+    groups: dict[str, List[str]],
+    primary_col: Optional[str],
+    *,
+    key_prefix: str,
+    top_n: int = 10,
+) -> None:
+    secondary_col = choose_secondary_category(df, groups, primary_col)
+    if not primary_col or not secondary_col:
+        return
+    base = df[[primary_col, secondary_col]].dropna().copy()
+    if len(base) < 5:
+        return
+    base[primary_col] = base[primary_col].astype(str)
+    base[secondary_col] = base[secondary_col].astype(str)
+    top_primary = base[primary_col].value_counts().head(top_n).index.tolist()
+    top_secondary = base[secondary_col].value_counts().head(8).index.tolist()
+    base = base[base[primary_col].isin(top_primary) & base[secondary_col].isin(top_secondary)]
+    if base.empty:
+        return
+
+    cross = pd.crosstab(base[primary_col], base[secondary_col]).reindex(top_primary).fillna(0)
+    long = cross.reset_index().melt(id_vars=primary_col, var_name=secondary_col, value_name="quantidade")
+    safe_primary = normalize_token_text(primary_col)
+    safe_secondary = normalize_token_text(secondary_col)
+    left, right = st.columns(2)
+
+    stacked = px.bar(
+        long,
+        x=primary_col,
+        y="quantidade",
+        color=secondary_col,
+        title=f"Cruzamento: {primary_col} x {secondary_col}",
+        text="quantidade",
+    )
+    stacked = apply_analytics_chart_layout(stacked, height=430)
+    left.plotly_chart(stacked, use_container_width=True, key=f"{key_prefix}_cross_stack_{safe_primary}_{safe_secondary}")
+    with left:
+        add_chart_reading(
+            f"Cruzamento {primary_col} x {secondary_col}",
+            [
+                "Este grafico cruza duas dimensoes para revelar onde o volume se concentra.",
+                "Use para encontrar combinacoes criticas, como status por cidade, motivo por equipe ou prioridade por canal.",
+            ],
+        )
+
+    heat = px.imshow(
+        cross,
+        text_auto=True,
+        aspect="auto",
+        title=f"Mapa de calor: quantidade por {primary_col} e {secondary_col}",
+        color_continuous_scale=["#EFF6FF", "#1D4ED8"],
+    )
+    heat = apply_analytics_chart_layout(heat, height=430)
+    right.plotly_chart(heat, use_container_width=True, key=f"{key_prefix}_cross_heat_{safe_primary}_{safe_secondary}")
+
+
+def render_count_based_insight_charts(
+    df: pd.DataFrame,
+    groups: dict[str, List[str]],
+    profile: dict,
+    *,
+    key_prefix: str,
+) -> None:
+    metric_numeric, id_like_cols = select_numeric_metric_columns(df, groups)
+    volume_col = pick_volume_id_column(df, id_like_cols)
+    preferred_cat = profile.get("recommended_dimension")
+    cat_cols = []
+    if preferred_cat in groups.get("categorical", []):
+        cat_cols.append(preferred_cat)
+    for col in groups.get("categorical", []):
+        if col not in cat_cols and 2 <= df[col].nunique(dropna=True) <= 50:
+            cat_cols.append(col)
+        if len(cat_cols) >= 3:
+            break
+
+    if cat_cols:
+        st.markdown("**Rankings por contagem (sem somar IDs/codigos)**")
+        cols = st.columns(len(cat_cols))
+        for i, col in enumerate(cat_cols):
+            dist = categorical_distribution(df, col, top_n=10)
+            fig = px.bar(
+                dist,
+                x=col,
+                y="quantidade",
+                text="quantidade",
+                title=f"Quantidade por {col}",
+                color="participacao_pct",
+                color_continuous_scale=["#DBEAFE", "#0369A1"],
+            )
+            fig.add_scatter(
+                x=dist[col],
+                y=dist["acumulado_pct"],
+                mode="lines+markers",
+                name="% acumulado",
+                yaxis="y2",
+                line=dict(color="#F97316", width=3),
+            )
+            fig.update_layout(yaxis2=dict(title="% acumulado", overlaying="y", side="right", range=[0, 105]))
+            fig = apply_analytics_chart_layout(fig, height=390)
+            cols[i].plotly_chart(fig, use_container_width=True, key=f"{key_prefix}_count_rank_{i}_{normalize_token_text(col)}")
+            with cols[i]:
+                add_chart_reading(f"Quantidade por {col}", category_reading(dist, col))
+
+    if groups.get("datetime"):
+        date_col = profile.get("recommended_date") if profile.get("recommended_date") in groups["datetime"] else max(groups["datetime"], key=lambda c: df[c].notna().sum())
+        time_df = df.copy()
+        time_df[date_col] = pd.to_datetime(time_df[date_col], errors="coerce", dayfirst=True)
+        time_df = time_df.dropna(subset=[date_col]).sort_values(date_col)
+        if len(time_df) >= 8:
+            span_days = int((time_df[date_col].max() - time_df[date_col].min()).days)
+            freq, freq_label = select_time_frequency(span_days)
+            base = time_df.set_index(date_col)
+            if volume_col:
+                trend = safe_resample_series(base[volume_col], freq, "nunique").reset_index(name="quantidade")
+                title = f"IDs unicos por {freq_label} ({volume_col})"
+            else:
+                trend = safe_resample_series(pd.Series(1, index=base.index), freq, "count").reset_index(name="quantidade")
+                title = f"Registros por {freq_label}"
+            if date_col not in trend.columns:
+                trend = trend.rename(columns={trend.columns[0]: date_col})
+            trend = enrich_trend_dataframe(trend, date_col, "quantidade")
+            fig = px.area(trend, x=date_col, y="quantidade", title=title)
+            fig.add_scatter(x=trend[date_col], y=trend["media_movel"], mode="lines", name="media movel", line=dict(color="#F97316", width=3))
+            fig = apply_analytics_chart_layout(fig, height=390)
+            st.plotly_chart(fig, use_container_width=True, key=f"{key_prefix}_count_trend_{normalize_token_text(date_col)}")
+            add_chart_reading(title, trend_reading(trend, "quantidade"))
+
+    render_category_cross_analysis(df, groups, cat_cols[0] if cat_cols else profile.get("recommended_dimension"), key_prefix=key_prefix, top_n=10)
+
+    if metric_numeric:
+        metric_col = profile.get("recommended_metric") if profile.get("recommended_metric") in metric_numeric else metric_numeric[0]
+        st.markdown("**Distribuicao da metrica recomendada**")
+        left, right = st.columns(2)
+        hist = px.histogram(df, x=metric_col, nbins=35, title=f"Distribuicao de {metric_col}", marginal="box")
+        add_mean_median_lines(hist, df[metric_col], axis="x")
+        hist = apply_analytics_chart_layout(hist, height=390)
+        left.plotly_chart(hist, use_container_width=True, key=f"{key_prefix}_metric_distribution_{normalize_token_text(metric_col)}")
+        with left:
+            add_chart_reading(f"Distribuicao de {metric_col}", numeric_distribution_reading(df, metric_col))
+        if cat_cols:
+            bx = df[[cat_cols[0], metric_col]].dropna().copy()
+            bx[cat_cols[0]] = bx[cat_cols[0]].astype(str)
+            top_values = bx[cat_cols[0]].value_counts().head(10).index.tolist()
+            bx = bx[bx[cat_cols[0]].isin(top_values)]
+            fig_box = px.box(bx, x=cat_cols[0], y=metric_col, title=f"{metric_col} por {cat_cols[0]}", points="outliers")
+            fig_box = apply_analytics_chart_layout(fig_box, height=390)
+            right.plotly_chart(fig_box, use_container_width=True, key=f"{key_prefix}_metric_box_{normalize_token_text(metric_col)}_{normalize_token_text(cat_cols[0])}")
+
+
 def build_metric_by_category(
     df: pd.DataFrame,
     cat_col: str,
@@ -2910,19 +3088,36 @@ def build_dashboard_export_bundle(
                 if preferred_metric in metric_numeric
                 else max(metric_numeric, key=lambda c: df[c].notna().sum())
             )
-            grp = (
-                df[[cat_col, metric_col]]
-                .dropna(subset=[cat_col, metric_col])
-                .assign(**{cat_col: lambda x: x[cat_col].astype(str)})
-                .groupby(cat_col, as_index=False)[metric_col]
-                .sum()
-                .sort_values(metric_col, ascending=False)
-                .head(top_n)
-            )
-            grp["coluna_categoria"] = cat_col
-            grp["coluna_metrica"] = metric_col
-            metric_by_category_df = grp[["coluna_categoria", cat_col, "coluna_metrica", metric_col]]
-            metric_by_category_df.columns = ["coluna_categoria", "categoria", "coluna_metrica", "valor_metrica"]
+            if default_aggregation_for_profile(spreadsheet_profile, metric_col) == "Contagem":
+                grp = (
+                    df[[cat_col]]
+                    .dropna(subset=[cat_col])
+                    .assign(**{cat_col: lambda x: x[cat_col].astype(str)})
+                    .groupby(cat_col, as_index=False)
+                    .size()
+                    .rename(columns={"size": "valor_metrica"})
+                    .sort_values("valor_metrica", ascending=False)
+                    .head(top_n)
+                )
+                grp["coluna_metrica"] = "contagem_registros"
+                metric_by_category_df = grp[["coluna_metrica", cat_col, "valor_metrica"]].copy()
+                metric_by_category_df.insert(0, "coluna_categoria", cat_col)
+                metric_by_category_df.columns = ["coluna_categoria", "coluna_metrica", "categoria", "valor_metrica"]
+                metric_by_category_df = metric_by_category_df[["coluna_categoria", "categoria", "coluna_metrica", "valor_metrica"]]
+            else:
+                grp = (
+                    df[[cat_col, metric_col]]
+                    .dropna(subset=[cat_col, metric_col])
+                    .assign(**{cat_col: lambda x: x[cat_col].astype(str)})
+                    .groupby(cat_col, as_index=False)[metric_col]
+                    .sum()
+                    .sort_values(metric_col, ascending=False)
+                    .head(top_n)
+                )
+                grp["coluna_categoria"] = cat_col
+                grp["coluna_metrica"] = metric_col
+                metric_by_category_df = grp[["coluna_categoria", cat_col, "coluna_metrica", metric_col]]
+                metric_by_category_df.columns = ["coluna_categoria", "categoria", "coluna_metrica", "valor_metrica"]
         elif volume_col:
             grp = (
                 df[[cat_col, volume_col]]
@@ -2955,9 +3150,14 @@ def build_dashboard_export_bundle(
                 trend_label = f"IDs unicos por {freq_label} ({volume_col})"
             elif metric_numeric:
                 metric_col = max(metric_numeric, key=lambda c: time_df[c].notna().sum())
-                trend_series = safe_resample_series(base[metric_col], freq, "sum")
-                trend = trend_series.reset_index(name="valor")
-                trend_label = f"Soma de {metric_col} por {freq_label}"
+                if default_aggregation_for_profile(spreadsheet_profile, metric_col) == "Contagem":
+                    trend_series = safe_resample_series(pd.Series(1, index=base.index), freq, "count")
+                    trend = trend_series.reset_index(name="valor")
+                    trend_label = f"Volume de registros por {freq_label}"
+                else:
+                    trend_series = safe_resample_series(base[metric_col], freq, "sum")
+                    trend = trend_series.reset_index(name="valor")
+                    trend_label = f"Soma de {metric_col} por {freq_label}"
             else:
                 trend_series = safe_resample_series(pd.Series(1, index=base.index), freq, "count")
                 trend = trend_series.reset_index(name="valor")
@@ -3212,15 +3412,22 @@ def render_management_dashboard(
         if metric_numeric
         else None
     )
+    agg_options = ["Contagem", "Soma", "Media", "Mediana"]
+    default_agg = default_aggregation_for_profile(spreadsheet_profile, dist_col)
+    agg_key = f"{key_prefix}_primary_metric_agg"
+    if agg_key not in st.session_state or st.session_state.get(agg_key) not in agg_options:
+        st.session_state[agg_key] = default_agg
     agg_mode = (
         controls[4].selectbox(
             "Agregacao",
-            options=["Soma", "Media", "Mediana", "Contagem"],
-            key=f"{key_prefix}_primary_metric_agg",
+            options=agg_options,
+            key=agg_key,
         )
         if metric_numeric
         else "Contagem"
     )
+    if agg_mode == "Soma":
+        st.caption("Atencao: soma deve ser usada apenas para metricas reais de negocio, como valor, receita, custo ou quantidade. IDs/codigos devem ser analisados por contagem.")
     st.session_state[f"{key_prefix}_config"] = {
         "cat_col": cat_col,
         "top_n": top_n,
@@ -3302,14 +3509,33 @@ def render_management_dashboard(
             with right:
                 add_chart_reading(f"Top {top_n} categorias - {cat_col}", category_reading(dist, cat_col))
 
+        treemap_fig = px.treemap(
+            dist,
+            path=[cat_col],
+            values="quantidade",
+            color="participacao_pct",
+            color_continuous_scale=["#E0F2FE", "#075985"],
+            title=f"Mapa de participacao por {cat_col}",
+        )
+        treemap_fig = apply_analytics_chart_layout(treemap_fig, height=380)
+        st.plotly_chart(treemap_fig, use_container_width=True, key=f"{key_prefix}_treemap_{normalize_token_text(cat_col)}")
+        render_category_cross_analysis(dashboard_df, dash_groups, cat_col, key_prefix=key_prefix, top_n=top_n)
+
     if date_col:
         trend_choices = ["Linhas por periodo"]
         if volume_col:
             trend_choices.append(f"IDs unicos ({volume_col})")
         trend_choices.extend([f"Metrica numerica ({c})" for c in metric_numeric])
         t1, t2 = st.columns(2)
-        trend_choice = t1.selectbox("Indicador da serie temporal", options=trend_choices, key=f"{key_prefix}_trend_choice")
-        metric_agg = t2.selectbox("Agregacao numerica temporal", options=["Soma", "Media", "Mediana", "Contagem"], key=f"{key_prefix}_trend_agg")
+        trend_choice_key = f"{key_prefix}_trend_choice"
+        if trend_choice_key not in st.session_state or st.session_state.get(trend_choice_key) not in trend_choices:
+            st.session_state[trend_choice_key] = f"IDs unicos ({volume_col})" if volume_col else "Linhas por periodo"
+        trend_choice = t1.selectbox("Indicador da serie temporal", options=trend_choices, key=trend_choice_key)
+        trend_agg_options = ["Contagem", "Soma", "Media", "Mediana"]
+        trend_agg_key = f"{key_prefix}_trend_agg"
+        if trend_agg_key not in st.session_state or st.session_state.get(trend_agg_key) not in trend_agg_options:
+            st.session_state[trend_agg_key] = default_aggregation_for_profile(spreadsheet_profile, dist_col)
+        metric_agg = t2.selectbox("Agregacao numerica temporal", options=trend_agg_options, key=trend_agg_key)
         st.session_state[f"{key_prefix}_config"].update({"trend_choice": trend_choice, "trend_agg": metric_agg})
 
         dt_series = pd.to_datetime(dashboard_df[date_col], errors="coerce", dayfirst=True)
@@ -5541,12 +5767,13 @@ def main() -> None:
 
     with tabs[3]:
         st.subheader("Insights e Visualizacoes")
+        st.caption("Nesta aba, a leitura prioriza contagem de registros/IDs e segmentacoes. Somas aparecem apenas como analise complementar quando a coluna for metrica real.")
         insights_df, insight_filters = apply_inline_filters(
             analysis_df,
             groups,
             key_prefix=f"insights_filters_{analysis_key}",
             title="Filtros da aba Insights",
-            expanded=False,
+            expanded=True,
             max_categories=80,
         )
         if insight_filters:
@@ -5556,8 +5783,20 @@ def main() -> None:
         else:
             insights_groups = get_column_groups(insights_df)
             insights_quality = compute_quality_report(insights_df, insights_groups, pd.DataFrame())
+            insights_missing_by_col = insights_df.isna().mean().mul(100).sort_values(ascending=False)
+            insights_issue_catalog = build_issue_catalog(insights_df, insights_quality, pd.DataFrame(), insights_missing_by_col)
             insights_corr = strongest_correlations(insights_df, top_n=10)
             insights_kpis = detect_kpis(insights_df, insights_groups)
+            insights_profile = detect_spreadsheet_profile(insights_df, insights_groups, insights_quality)
+            insight_metric_numeric, insight_id_like = select_numeric_metric_columns(insights_df, insights_groups)
+            insight_volume_col = pick_volume_id_column(insights_df, insight_id_like)
+            s1, s2, s3, s4, s5 = st.columns(5)
+            s1.metric("Registros no recorte", f"{len(insights_df):,}".replace(",", "."))
+            s2.metric("Tipo detectado", clean_report_text(insights_profile.get("tipo", "-"), 26))
+            s3.metric("Confianca", f"{float(insights_profile.get('confianca', 0.0)):.1f}%")
+            s4.metric("IDs unicos", f"{insights_df[insight_volume_col].nunique(dropna=True):,}".replace(",", ".") if insight_volume_col else "-")
+            s5.metric("Score qualidade", f"{insights_quality['score']:.1f}")
+            st.info(clean_report_text(insights_profile.get("melhor_analise", "Analise recomendada indisponivel."), 420))
             insights_notes = generate_professional_insights(
                 insights_df,
                 insights_groups,
@@ -5566,12 +5805,10 @@ def main() -> None:
                 insights_kpis,
                 treatment_report=treatment_report,
             )
-            st.markdown("**Insights automaticos**")
+            st.markdown("**Insights claros do recorte filtrado**")
             for i in insights_notes:
                 st.markdown(f"- {i}")
-            st.markdown("**Plano de acao recomendado**")
-            for r in recommendations:
-                st.markdown(f"- {r}")
+
             st.markdown("**KPIs detectados automaticamente**")
             if insights_kpis:
                 cols = st.columns(len(insights_kpis))
@@ -5582,11 +5819,25 @@ def main() -> None:
                         cols[i].caption(item["alert"])
             else:
                 st.info("Sem KPIs suficientes para deteccao automatica.")
-            render_auto_charts(insights_df, insights_groups, insights_corr, key_prefix=f"insights_{analysis_key}")
+
+            render_count_based_insight_charts(
+                insights_df,
+                insights_groups,
+                insights_profile,
+                key_prefix=f"insights_count_{analysis_key}",
+            )
+
+            st.markdown("**Plano de acao recomendado para este recorte**")
+            scoped_action_df = build_structured_action_plan(area, insights_quality, insights_issue_catalog)
+            st.dataframe(scoped_action_df.head(6), use_container_width=True)
+
+            with st.expander("Analises avancadas complementares", expanded=False):
+                st.caption("Esta area pode usar distribuicao numerica, correlacao e graficos estatisticos. Para IDs/codigos, prefira sempre contagem.")
+                render_auto_charts(insights_df, insights_groups, insights_corr, key_prefix=f"insights_{analysis_key}")
             if len(insights_corr) > 0:
                 st.markdown("**Correlacoes de destaque**")
                 st.dataframe(insights_corr, use_container_width=True)
-                insight_metric_cols, _ = select_numeric_metric_columns(insights_df, insights_groups)
+                insight_metric_cols = insight_metric_numeric
                 if len(insight_metric_cols) >= 2:
                     corr_matrix = insights_df[insight_metric_cols].corr(numeric_only=True)
                     st.plotly_chart(
