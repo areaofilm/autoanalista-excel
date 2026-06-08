@@ -5101,8 +5101,12 @@ def main() -> None:
     for widget_key in [target_sidebar_key, target_tab_key]:
         if st.session_state.get(widget_key) not in target_options:
             st.session_state[widget_key] = st.session_state[target_state_key]
+        elif st.session_state.get(widget_key) != st.session_state[target_state_key]:
+            st.session_state[widget_key] = st.session_state[target_state_key]
     for widget_key in [model_sidebar_key, model_tab_key]:
         if st.session_state.get(widget_key) not in model_options:
+            st.session_state[widget_key] = st.session_state[model_state_key]
+        elif st.session_state.get(widget_key) != st.session_state[model_state_key]:
             st.session_state[widget_key] = st.session_state[model_state_key]
 
     predictive_target_col = st.session_state[target_state_key]
@@ -5116,8 +5120,7 @@ def main() -> None:
             st.sidebar.caption(f"Sugestao: `{best_ml_target}` ({ml_target_suggestions[0]['tipo']}).")
             if st.sidebar.button("Usar alvo sugerido", use_container_width=True, key=f"use_suggested_target_sidebar_{analysis_key}"):
                 st.session_state[target_state_key] = best_ml_target
-                st.session_state[target_sidebar_key] = best_ml_target
-                st.session_state[target_tab_key] = best_ml_target
+                st.rerun()
         st.sidebar.selectbox(
             "Variavel alvo para prever",
             options=target_options,
@@ -5256,8 +5259,6 @@ def main() -> None:
                 st.dataframe(sug_df, use_container_width=True, height=180)
                 if best_ml_target and st.button("Aplicar melhor alvo sugerido", use_container_width=True, key=f"use_suggested_target_tab_{analysis_key}"):
                     st.session_state[target_state_key] = best_ml_target
-                    st.session_state[target_tab_key] = best_ml_target
-                    st.session_state[target_sidebar_key] = best_ml_target
                     st.rerun()
             else:
                 st.caption("Nao encontrei uma variavel alvo claramente recomendada. Voce ainda pode selecionar manualmente.")
