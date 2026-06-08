@@ -647,6 +647,52 @@ def get_secret_value(name: str) -> str:
         return os.getenv(name, "")
 
 
+def fetch_turbo_models(api_key: str, base_url: str) -> Tuple[bool, object]:
+    if not api_key:
+        return False, "Informe uma chave API antes de listar modelos."
+    url = f"{str(base_url).rstrip('/')}/models"
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="ignore")[:2000]
+        return False, friendly_turbo_api_error(exc.code, detail)
+    except Exception as exc:
+        return False, f"Nao foi possivel listar modelos neste endpoint: {str(exc)[:300]}"
+
+    raw_models = []
+    if isinstance(payload, dict):
+        if isinstance(payload.get("data"), list):
+            raw_models = payload["data"]
+        elif isinstance(payload.get("models"), list):
+            raw_models = payload["models"]
+        elif isinstance(payload.get("result"), list):
+            raw_models = payload["result"]
+    elif isinstance(payload, list):
+        raw_models = payload
+
+    models = []
+    for item in raw_models:
+        if isinstance(item, dict):
+            model_id = item.get("id") or item.get("name") or item.get("model")
+        else:
+            model_id = item
+        if model_id:
+            models.append(str(model_id))
+    models = sorted(set(models))
+    if not models:
+        return False, "A API respondeu, mas nao retornou uma lista de modelos reconhecivel."
+    return True, models
+
+
 def render_turbo_ai_controls() -> dict:
     provider_presets = {
         "OpenAI": {
@@ -734,28 +780,48 @@ def render_turbo_ai_controls() -> dict:
     secret_key_available = bool(get_secret_value(secret_name)) if secret_name else False
     if secret_key_available and not api_key:
         use_secret = st.sidebar.checkbox(f"Usar `{secret_name}` do Streamlit Secrets", value=True, key="turbo_use_secret")
+    selected_key = api_key.strip() or (get_secret_value(secret_name) if use_secret and secret_name else "")
     enabled = st.sidebar.checkbox("Ativar Modo Turbo", value=False, key="turbo_enabled")
     with st.sidebar.expander("Configuracao avancada do Turbo", expanded=False):
         if provider == "Personalizado":
-            model = st.text_input("Modelo", value=st.session_state.get("turbo_custom_model", "modelo-personalizado"), key="turbo_custom_model")
             base_url = st.text_input("Endpoint", value=st.session_state.get("turbo_custom_base_url", preset["endpoint"]), key="turbo_custom_base_url")
+            model_options = []
         else:
-            model = st.selectbox(
-                "Modelo",
-                options=preset["models"],
-                index=0,
-                key=f"turbo_model_{normalize_token_text(provider)}",
-            )
             base_url = st.text_input(
                 "Endpoint",
                 value=preset["endpoint"],
                 key=f"turbo_base_url_{normalize_token_text(provider)}",
             )
+            model_options = preset["models"]
+        model_cache_key = f"turbo_model_list_{normalize_token_text(provider)}_{hash_text(str(base_url))[:8]}"
+        if st.button(
+            "Listar modelos disponiveis da API",
+            use_container_width=True,
+            key=f"list_models_{normalize_token_text(provider)}",
+            disabled=not bool(selected_key),
+        ):
+            ok_models, model_result = fetch_turbo_models(selected_key, base_url)
+            st.session_state[model_cache_key] = {"ok": ok_models, "result": model_result}
+        listed_models = st.session_state.get(model_cache_key)
+        if listed_models:
+            if listed_models.get("ok"):
+                model_options = listed_models.get("result", []) or model_options
+                st.success(f"{len(model_options)} modelo(s) encontrados para esta chave/API.")
+            else:
+                st.warning(listed_models.get("result", "Nao foi possivel listar modelos."))
+
+        if model_options:
+            default_model = preset["models"][0] if preset["models"][0] in model_options else model_options[0]
+            model_key = f"turbo_model_{normalize_token_text(provider)}_{hash_text(str(base_url))[:8]}"
+            if st.session_state.get(model_key) not in model_options:
+                st.session_state[model_key] = default_model
+            model = st.selectbox("Modelo", options=model_options, key=model_key)
+        else:
+            model = st.text_input("Modelo", value=st.session_state.get("turbo_custom_model", "modelo-personalizado"), key="turbo_custom_model")
         st.caption("O app acrescenta automaticamente `/chat/completions` ao endpoint informado.")
         if provider == "Grok / xAI":
             st.caption("Se um modelo nao funcionar, confira no console xAI quais modelos estao liberados para sua chave.")
 
-    selected_key = api_key.strip() or (get_secret_value(secret_name) if use_secret and secret_name else "")
     active = bool(enabled and selected_key)
     if enabled and not selected_key:
         st.sidebar.warning("Modo Turbo marcado, mas nenhuma chave API foi informada.")
