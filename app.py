@@ -45,6 +45,7 @@ from sklearn.inspection import permutation_importance
 from sklearn.linear_model import LinearRegression, LogisticRegression
 from sklearn.metrics import (
     accuracy_score,
+    confusion_matrix,
     f1_score,
     mean_absolute_error,
     mean_squared_error,
@@ -3267,6 +3268,150 @@ def ml_reliability_alert(problem_type: str, metrics: dict) -> str:
     return "Confiabilidade baixa: modelo tem baixo poder explicativo para previsao operacional neste conjunto de dados."
 
 
+def suggest_ml_targets(df: pd.DataFrame, groups: dict[str, List[str]], max_items: int = 6) -> List[dict]:
+    id_like_cols = set(detect_id_like_columns(df))
+    suggestions = []
+    preferred_tokens = [
+        "status",
+        "situacao",
+        "resultado",
+        "risco",
+        "atraso",
+        "sla",
+        "cancelado",
+        "inadimplente",
+        "valor",
+        "custo",
+        "tempo",
+        "prazo",
+        "score",
+        "nota",
+    ]
+    for col in df.columns:
+        if col in id_like_cols:
+            continue
+        non_null = df[col].dropna()
+        if len(non_null) < 30:
+            continue
+        missing_pct = 100.0 * (1.0 - len(non_null) / max(len(df), 1))
+        nunique = int(non_null.nunique(dropna=True))
+        unique_ratio = nunique / max(len(non_null), 1)
+        key = normalize_token_text(col)
+        score = 0.0
+        reasons = []
+        if any(tok in key for tok in preferred_tokens):
+            score += 35
+            reasons.append("nome indica alvo de negocio")
+        if pd.api.types.is_numeric_dtype(df[col]) and nunique > 10:
+            score += 20
+            reasons.append("numerico continuo para regressao")
+        elif 2 <= nunique <= 20:
+            score += 25
+            reasons.append("classes manejaveis para classificacao")
+        if missing_pct <= 10:
+            score += 15
+            reasons.append("baixo percentual de nulos")
+        if unique_ratio < 0.5:
+            score += 10
+        if len(non_null) >= 100:
+            score += 10
+        if score <= 0:
+            continue
+        suggestions.append(
+            {
+                "coluna": col,
+                "tipo": infer_problem_type(df[col]),
+                "score": round(score, 1),
+                "nulos_pct": round(missing_pct, 2),
+                "valores_unicos": nunique,
+                "motivo": "; ".join(reasons[:3]) or "potencial estatistico razoavel",
+            }
+        )
+    return sorted(suggestions, key=lambda item: item["score"], reverse=True)[:max_items]
+
+
+def diagnose_ml_target(df: pd.DataFrame, target_col: str) -> Tuple[List[str], List[str]]:
+    warnings: List[str] = []
+    strengths: List[str] = []
+    if target_col == "(nao usar)" or target_col not in df.columns:
+        return warnings, strengths
+    y = df[target_col]
+    non_null = y.dropna()
+    missing_pct = 100.0 * (1.0 - len(non_null) / max(len(df), 1))
+    nunique = int(non_null.nunique(dropna=True))
+    if len(non_null) < 100:
+        warnings.append("Poucos registros com alvo preenchido; o modelo pode ficar instavel.")
+    else:
+        strengths.append("Volume minimo de registros preenchidos adequado para treino inicial.")
+    if missing_pct > 20:
+        warnings.append(f"Alvo com {missing_pct:.1f}% de nulos; isso reduz a base util de treinamento.")
+    if infer_problem_type(y) == "classification":
+        counts = non_null.astype(str).value_counts()
+        if len(counts) < 2:
+            warnings.append("Alvo possui menos de 2 classes; nao e possivel classificar.")
+        elif len(counts) > 30:
+            warnings.append("Alvo possui muitas classes; recomenda agrupar categorias antes de treinar.")
+        else:
+            strengths.append(f"Classificacao com {len(counts)} classes detectadas.")
+        if len(counts) > 1:
+            imbalance = float(counts.iloc[0] / max(counts.sum(), 1))
+            if imbalance >= 0.85:
+                warnings.append(f"Classe dominante representa {imbalance * 100:.1f}% dos casos; avaliar desbalanceamento.")
+    else:
+        numeric = pd.to_numeric(non_null, errors="coerce").dropna()
+        if len(numeric) < 30:
+            warnings.append("Alvo numerico tem poucos valores validos para regressao.")
+        if len(numeric) > 0 and numeric.nunique(dropna=True) < 10:
+            warnings.append("Alvo numerico tem baixa variacao; classificacao ou faixas podem ser melhores.")
+        if len(numeric) >= 30:
+            strengths.append("Alvo numerico possui variacao suficiente para uma regressao inicial.")
+    id_like = detect_id_like_columns(df[[target_col]]) if target_col in df.columns else []
+    if id_like:
+        warnings.append("A coluna parece identificador/codigo; normalmente nao e um bom alvo preditivo.")
+    return warnings, strengths
+
+
+def ml_business_explanation(result: dict) -> List[str]:
+    if not result:
+        return []
+    target = result.get("target_col", "alvo")
+    model = result.get("model_choice", "modelo")
+    kind = result.get("problem_type", "-")
+    bullets = [f"O modelo `{model}` foi treinado para prever `{target}` usando as demais colunas validas da planilha."]
+    if kind == "classification":
+        bullets.append(
+            f"Como o alvo e categorico, a leitura principal e F1/acuracia. F1 holdout: {float(result.get('holdout_f1', 0.0)):.3f}."
+        )
+    else:
+        bullets.append(
+            f"Como o alvo e numerico, a leitura principal e R2/RMSE. R2 holdout: {float(result.get('holdout_r2', 0.0)):.3f}."
+        )
+    if result.get("model_reliability_alert"):
+        bullets.append(result["model_reliability_alert"])
+    top_features = result.get("feature_importance", [])[:3]
+    if top_features:
+        feats = ", ".join([item["feature"] for item in top_features])
+        bullets.append(f"Variaveis com maior influencia estimada: {feats}.")
+    if result.get("removed_leakage_features"):
+        bullets.append("Algumas colunas foram removidas por risco de vazamento de informacao do alvo.")
+    return bullets
+
+
+def prepare_prediction_input(df: pd.DataFrame, training_features: List[str]) -> pd.DataFrame:
+    prepared = df.copy()
+    for col in training_features:
+        if col not in prepared.columns:
+            prepared[col] = np.nan
+    return prepared[training_features]
+
+
+def public_ml_summary(result: Optional[dict]) -> dict:
+    if not result:
+        return {}
+    hidden_keys = {"pipeline"}
+    return {k: v for k, v in result.items() if k not in hidden_keys}
+
+
 def sanitize_ml_features(x: pd.DataFrame) -> Tuple[pd.DataFrame, List[str], List[str], List[dict]]:
     clean = x.copy().dropna(axis=1, how="all")
     warnings = []
@@ -3342,6 +3487,7 @@ def run_supervised_ml(
         return None
 
     x, num, cat, feature_warnings = sanitize_ml_features(x)
+    training_features = x.columns.tolist()
     if feature_warnings:
         st.info("Algumas colunas categoricas tinham muitos valores unicos e foram agrupadas para estabilizar o modelo.")
         st.dataframe(pd.DataFrame(feature_warnings), use_container_width=True)
@@ -3405,6 +3551,11 @@ def run_supervised_ml(
         sample_y = y_test.loc[sample_x.index]
         imp = permutation_importance(pipe, sample_x, sample_y, scoring="f1_weighted", n_repeats=5, random_state=SEED)
         imp_df = pd.DataFrame({"feature": sample_x.columns, "importance": imp.importances_mean}).sort_values("importance", ascending=False)
+        labels = sorted(pd.Series(y_test).astype(str).unique().tolist())
+        cm = confusion_matrix(pd.Series(y_test).astype(str), pd.Series(pred).astype(str), labels=labels)
+        cm_df = pd.DataFrame(cm, index=[f"real_{x}" for x in labels], columns=[f"previsto_{x}" for x in labels])
+        st.markdown("**Matriz de confusao (holdout)**")
+        st.dataframe(cm_df, use_container_width=True)
         st.plotly_chart(
             px.bar(imp_df.head(12), x="feature", y="importance", title="Top features (permutation importance)"),
             use_container_width=True,
@@ -3425,6 +3576,9 @@ def run_supervised_ml(
             "removed_leakage_features": leak_cols,
             "feature_importance": serialize_feature_importance(imp_df),
             "model_reliability_alert": ml_reliability_alert("classification", metrics),
+            "confusion_matrix": cm_df.reset_index().rename(columns={"index": "real"}).to_dict("records"),
+            "training_features": training_features,
+            "pipeline": pipe,
         }
 
     cv_folds = 5 if len(x) >= 100 else 3
@@ -3470,6 +3624,14 @@ def run_supervised_ml(
     sample_y = y_test.loc[sample_x.index]
     imp = permutation_importance(pipe, sample_x, sample_y, scoring="r2", n_repeats=5, random_state=SEED)
     imp_df = pd.DataFrame({"feature": sample_x.columns, "importance": imp.importances_mean}).sort_values("importance", ascending=False)
+    pred_df = pd.DataFrame({"real": y_test, "previsto": pred})
+    pred_df["erro"] = pred_df["previsto"] - pred_df["real"]
+    fig_pred = px.scatter(pred_df, x="real", y="previsto", title="Real vs previsto (holdout)", opacity=0.7)
+    min_line = float(min(pred_df["real"].min(), pred_df["previsto"].min()))
+    max_line = float(max(pred_df["real"].max(), pred_df["previsto"].max()))
+    fig_pred.add_scatter(x=[min_line, max_line], y=[min_line, max_line], mode="lines", name="ideal", line=dict(color="#F97316", dash="dash"))
+    fig_pred = apply_analytics_chart_layout(fig_pred)
+    st.plotly_chart(fig_pred, use_container_width=True, key=f"{key_prefix}_regression_real_vs_pred")
     st.plotly_chart(
         px.bar(imp_df.head(12), x="feature", y="importance", title="Top features (permutation importance)"),
         use_container_width=True,
@@ -3492,6 +3654,9 @@ def run_supervised_ml(
         "removed_leakage_features": leak_cols,
         "feature_importance": serialize_feature_importance(imp_df),
         "model_reliability_alert": ml_reliability_alert("regression", metrics),
+        "prediction_sample": pred_df.head(200).to_dict("records"),
+        "training_features": training_features,
+        "pipeline": pipe,
     }
 
 
@@ -4724,6 +4889,8 @@ def main() -> None:
 
     target_options = ["(nao usar)"] + analysis_df.columns.tolist()
     model_options = ["Random Forest", "Regressao Linear / Logistica"]
+    ml_target_suggestions = suggest_ml_targets(analysis_df, groups)
+    best_ml_target = ml_target_suggestions[0]["coluna"] if ml_target_suggestions else None
     target_state_key = f"predictive_target_value_{analysis_key}"
     target_sidebar_key = f"predictive_target_sidebar_{analysis_key}"
     target_tab_key = f"predictive_target_tab_{analysis_key}"
@@ -4749,6 +4916,12 @@ def main() -> None:
         st.sidebar.markdown("---")
         st.sidebar.subheader("Modelagem Preditiva")
         st.sidebar.caption("Usa os dados ja tratados, filtrados e saneados pela analise atual.")
+        if best_ml_target:
+            st.sidebar.caption(f"Sugestao: `{best_ml_target}` ({ml_target_suggestions[0]['tipo']}).")
+            if st.sidebar.button("Usar alvo sugerido", use_container_width=True, key=f"use_suggested_target_sidebar_{analysis_key}"):
+                st.session_state[target_state_key] = best_ml_target
+                st.session_state[target_sidebar_key] = best_ml_target
+                st.session_state[target_tab_key] = best_ml_target
         st.sidebar.selectbox(
             "Variavel alvo para prever",
             options=target_options,
@@ -4881,6 +5054,17 @@ def main() -> None:
                 "Escolha abaixo a variavel alvo que deseja prever. O treinamento usa o dataframe principal ja tratado, "
                 "com limpeza, duplicidades e outliers conforme a configuracao atual."
             )
+            if ml_target_suggestions:
+                st.markdown("**Sugestoes automaticas de alvo**")
+                sug_df = pd.DataFrame(ml_target_suggestions)
+                st.dataframe(sug_df, use_container_width=True, height=180)
+                if best_ml_target and st.button("Aplicar melhor alvo sugerido", use_container_width=True, key=f"use_suggested_target_tab_{analysis_key}"):
+                    st.session_state[target_state_key] = best_ml_target
+                    st.session_state[target_tab_key] = best_ml_target
+                    st.session_state[target_sidebar_key] = best_ml_target
+                    st.rerun()
+            else:
+                st.caption("Nao encontrei uma variavel alvo claramente recomendada. Voce ainda pode selecionar manualmente.")
             ml_cfg1, ml_cfg2 = st.columns(2)
             ml_cfg1.selectbox(
                 "Variavel alvo para prever",
@@ -4902,6 +5086,22 @@ def main() -> None:
                 st.warning("Selecione uma variavel alvo para liberar o treinamento supervisionado.")
             else:
                 st.success(f"Pronto para treinar `{predictive_model_choice}` prevendo `{predictive_target_col}`.")
+                target_warnings, target_strengths = diagnose_ml_target(analysis_df, predictive_target_col)
+                d1, d2 = st.columns(2)
+                with d1:
+                    st.markdown("**Pontos fortes do alvo**")
+                    if target_strengths:
+                        for item in target_strengths:
+                            st.caption(f"- {item}")
+                    else:
+                        st.caption("Sem ponto forte automatico destacado.")
+                with d2:
+                    st.markdown("**Alertas antes do treino**")
+                    if target_warnings:
+                        for item in target_warnings:
+                            st.warning(item)
+                    else:
+                        st.caption("Nenhum alerta relevante detectado.")
             contamination = st.slider(
                 "Taxa de anomalias (ML sem alvo)",
                 min_value=0.01,
@@ -4954,7 +5154,63 @@ def main() -> None:
                 ml_sup = cached_sup["summary"]
                 if ml_sup:
                     st.info("Resultado de ML supervisionado carregado do cache desta configuracao.")
-                    st.json(ml_sup)
+                    st.json(public_ml_summary(ml_sup))
+
+            if ml_sup:
+                st.markdown("**Explicacao gerencial do modelo**")
+                for item in ml_business_explanation(ml_sup):
+                    st.markdown(f"- {item}")
+
+                if ml_sup.get("problem_type") == "classification" and ml_sup.get("confusion_matrix"):
+                    st.markdown("**Matriz de confusao salva do holdout**")
+                    st.dataframe(pd.DataFrame(ml_sup["confusion_matrix"]), use_container_width=True)
+                if ml_sup.get("problem_type") == "regression" and ml_sup.get("prediction_sample"):
+                    st.markdown("**Amostra real vs previsto**")
+                    sample_pred = pd.DataFrame(ml_sup["prediction_sample"])
+                    st.dataframe(sample_pred.head(30), use_container_width=True)
+
+                st.markdown("**Prever nova planilha com este modelo**")
+                pred_file = st.file_uploader(
+                    "Envie uma nova planilha com as mesmas colunas de entrada",
+                    type=SUPPORTED_TYPES,
+                    key=f"predict_new_file_{analysis_key}_{predictive_target_col}",
+                )
+                if pred_file is not None:
+                    try:
+                        pred_workbook = read_workbook(pred_file.getvalue(), pred_file.name)
+                        pred_sheet = (
+                            list(pred_workbook.keys())[0]
+                            if len(pred_workbook) == 1
+                            else st.selectbox(
+                                "Selecione a aba para previsao",
+                                options=list(pred_workbook.keys()),
+                                key=f"predict_new_sheet_{analysis_key}_{predictive_target_col}",
+                            )
+                        )
+                        pred_raw = pred_workbook[pred_sheet].copy()
+                        pred_df, _ = coerce_data_types(pred_raw)
+                        pipe = ml_sup.get("pipeline")
+                        training_features = ml_sup.get("training_features", [])
+                        if pipe is None or not training_features:
+                            st.warning("Modelo carregado sem pipeline ativo. Treine novamente para prever uma nova planilha.")
+                        else:
+                            x_new = prepare_prediction_input(pred_df, training_features)
+                            preds = pipe.predict(x_new)
+                            result_pred = pred_df.copy()
+                            result_pred[f"previsao_{ml_sup.get('target_col', 'alvo')}"] = preds
+                            st.dataframe(result_pred.head(80), use_container_width=True)
+                            pred_bytes = result_pred.head(MAX_EXPORT_ROWS).to_csv(index=False).encode("utf-8-sig")
+                            st.download_button(
+                                "Baixar previsoes CSV",
+                                data=pred_bytes,
+                                file_name=f"previsoes_{Path(pred_file.name).stem}.csv",
+                                mime="text/csv",
+                                use_container_width=True,
+                                key=f"download_predictions_{analysis_key}_{predictive_target_col}",
+                            )
+                    except Exception as exc:
+                        st.error("Nao foi possivel gerar previsoes para a nova planilha.")
+                        st.caption(str(exc)[:500])
         else:
             st.info("Perfil viewer sem permissao para executar ML.")
 
