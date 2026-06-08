@@ -648,7 +648,26 @@ def get_secret_value(name: str) -> str:
 
 
 def render_turbo_ai_controls() -> dict:
-    secret_key_available = bool(get_secret_value("OPENAI_API_KEY"))
+    provider_presets = {
+        "OpenAI": {
+            "secret": "OPENAI_API_KEY",
+            "endpoint": "https://api.openai.com/v1",
+            "models": ["gpt-4o-mini", "gpt-4o", "gpt-4.1-mini"],
+            "hint": "Chaves OpenAI geralmente comecam com `sk-` ou `sk-proj-`.",
+        },
+        "Grok / xAI": {
+            "secret": "XAI_API_KEY",
+            "endpoint": "https://api.x.ai/v1",
+            "models": ["grok-4", "grok-3-mini", "grok-3"],
+            "hint": "Chaves xAI/Grok geralmente ficam no console da xAI e podem comecar com `xai-`.",
+        },
+        "Personalizado": {
+            "secret": "",
+            "endpoint": "https://api.openai.com/v1",
+            "models": ["modelo-personalizado"],
+            "hint": "Use qualquer API compativel com `/chat/completions`.",
+        },
+    }
     st.sidebar.markdown(
         """
         <style>
@@ -691,8 +710,19 @@ def render_turbo_ai_controls() -> dict:
         """,
         unsafe_allow_html=True,
     )
+
+    provider = st.sidebar.selectbox(
+        "Qual chave/API voce possui?",
+        options=list(provider_presets.keys()),
+        index=0,
+        key="turbo_provider",
+        help="Escolha o provedor para o app preencher endpoint e sugestoes de modelo automaticamente.",
+    )
+    preset = provider_presets[provider]
+    st.sidebar.caption(preset["hint"])
+
     api_key = st.sidebar.text_input(
-        "Chave API",
+        f"Chave API ({provider})",
         type="password",
         value="",
         placeholder="Cole sua API key aqui",
@@ -700,15 +730,32 @@ def render_turbo_ai_controls() -> dict:
         help="A chave fica apenas na sessao atual e nao e salva no banco, historico ou relatorios.",
     )
     use_secret = False
+    secret_name = preset.get("secret", "")
+    secret_key_available = bool(get_secret_value(secret_name)) if secret_name else False
     if secret_key_available and not api_key:
-        use_secret = st.sidebar.checkbox("Usar chave configurada no Streamlit Secrets", value=True, key="turbo_use_secret")
+        use_secret = st.sidebar.checkbox(f"Usar `{secret_name}` do Streamlit Secrets", value=True, key="turbo_use_secret")
     enabled = st.sidebar.checkbox("Ativar Modo Turbo", value=False, key="turbo_enabled")
     with st.sidebar.expander("Configuracao avancada do Turbo", expanded=False):
-        model = st.text_input("Modelo", value="gpt-4o-mini", key="turbo_model")
-        base_url = st.text_input("Endpoint", value="https://api.openai.com/v1", key="turbo_base_url")
-        st.caption("Use endpoint compativel com `/chat/completions`.")
+        if provider == "Personalizado":
+            model = st.text_input("Modelo", value=st.session_state.get("turbo_custom_model", "modelo-personalizado"), key="turbo_custom_model")
+            base_url = st.text_input("Endpoint", value=st.session_state.get("turbo_custom_base_url", preset["endpoint"]), key="turbo_custom_base_url")
+        else:
+            model = st.selectbox(
+                "Modelo",
+                options=preset["models"],
+                index=0,
+                key=f"turbo_model_{normalize_token_text(provider)}",
+            )
+            base_url = st.text_input(
+                "Endpoint",
+                value=preset["endpoint"],
+                key=f"turbo_base_url_{normalize_token_text(provider)}",
+            )
+        st.caption("O app acrescenta automaticamente `/chat/completions` ao endpoint informado.")
+        if provider == "Grok / xAI":
+            st.caption("Se um modelo nao funcionar, confira no console xAI quais modelos estao liberados para sua chave.")
 
-    selected_key = api_key.strip() or (get_secret_value("OPENAI_API_KEY") if use_secret else "")
+    selected_key = api_key.strip() or (get_secret_value(secret_name) if use_secret and secret_name else "")
     active = bool(enabled and selected_key)
     if enabled and not selected_key:
         st.sidebar.warning("Modo Turbo marcado, mas nenhuma chave API foi informada.")
@@ -720,8 +767,9 @@ def render_turbo_ai_controls() -> dict:
     return {
         "enabled": active,
         "api_key": selected_key,
-        "model": model.strip() or "gpt-4o-mini",
-        "base_url": base_url.strip().rstrip("/") or "https://api.openai.com/v1",
+        "provider": provider,
+        "model": str(model).strip() or preset["models"][0],
+        "base_url": str(base_url).strip().rstrip("/") or preset["endpoint"],
     }
 
 
