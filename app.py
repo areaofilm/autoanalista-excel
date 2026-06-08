@@ -714,10 +714,22 @@ def render_turbo_ai_controls() -> dict:
             "hint": "Use qualquer API compativel com `/chat/completions`.",
         },
     }
+    status = st.session_state.get(
+        "turbo_api_status",
+        {"state": "untested", "label": "Nao testada", "detail": "Informe uma chave e teste a conexao."},
+    )
+    status_state = status.get("state", "untested")
+    if status_state == "online":
+        status_color, status_bg, status_label = "#22C55E", "rgba(34, 197, 94, 0.15)", "ONLINE"
+    elif status_state == "offline":
+        status_color, status_bg, status_label = "#EF4444", "rgba(239, 68, 68, 0.15)", "OFFLINE"
+    else:
+        status_color, status_bg, status_label = "#94A3B8", "rgba(148, 163, 184, 0.14)", "NAO TESTADA"
+
     st.sidebar.markdown(
-        """
+        f"""
         <style>
-        .turbo-api-card {
+        .turbo-api-card {{
             margin: 10px 0 12px 0;
             padding: 13px 14px;
             border: 1px solid rgba(56, 189, 248, 0.45);
@@ -726,14 +738,14 @@ def render_turbo_ai_controls() -> dict:
                 radial-gradient(circle at top left, rgba(14, 165, 233, 0.24), transparent 42%),
                 linear-gradient(135deg, rgba(15, 23, 42, 0.92), rgba(8, 47, 73, 0.86));
             box-shadow: 0 0 0 1px rgba(125, 211, 252, 0.08), 0 14px 30px rgba(2, 8, 23, 0.28);
-        }
-        .turbo-api-title {
+        }}
+        .turbo-api-title {{
             font-size: 18px;
             font-weight: 900;
             letter-spacing: .3px;
             color: #E0F2FE;
-        }
-        .turbo-api-cta {
+        }}
+        .turbo-api-cta {{
             margin-top: 8px;
             font-size: 15px;
             font-weight: 900;
@@ -741,21 +753,47 @@ def render_turbo_ai_controls() -> dict:
             text-transform: uppercase;
             letter-spacing: .7px;
             text-shadow: 0 0 12px rgba(250, 204, 21, .35);
-        }
-        .turbo-api-note {
+        }}
+        .turbo-api-note {{
             margin-top: 6px;
             font-size: 12px;
             color: #BAE6FD;
-        }
+        }}
+        .turbo-status-pill {{
+            display: inline-flex;
+            align-items: center;
+            gap: 7px;
+            margin-top: 10px;
+            padding: 7px 10px;
+            border-radius: 999px;
+            background: {status_bg};
+            color: {status_color};
+            border: 1px solid {status_color};
+            font-size: 12px;
+            font-weight: 900;
+            letter-spacing: .6px;
+        }}
+        .turbo-status-dot {{
+            width: 9px;
+            height: 9px;
+            border-radius: 50%;
+            background: {status_color};
+            box-shadow: 0 0 12px {status_color};
+        }}
         </style>
         <div class="turbo-api-card">
             <div class="turbo-api-title">Modo Turbo IA</div>
             <div class="turbo-api-note">Opcional: o app continua funcionando sem API.</div>
             <div class="turbo-api-cta">Ativar modo turbo com API</div>
+            <div class="turbo-status-pill"><span class="turbo-status-dot"></span> API {status_label}</div>
         </div>
         """,
         unsafe_allow_html=True,
     )
+    if status_state == "online":
+        st.sidebar.caption(f"API online: {status.get('detail', 'conexao validada')}")
+    elif status_state == "offline":
+        st.sidebar.caption(f"API offline: {clean_report_text(status.get('detail', '-'), 140)}")
 
     provider = st.sidebar.selectbox(
         "Qual chave/API voce possui?",
@@ -795,6 +833,28 @@ def render_turbo_ai_controls() -> dict:
             model_options = preset["models"]
         model_cache_key = f"turbo_model_list_{normalize_token_text(provider)}_{hash_text(str(base_url))[:8]}"
         if st.button(
+            "Testar status da API",
+            use_container_width=True,
+            key=f"test_api_{normalize_token_text(provider)}",
+            disabled=not bool(selected_key),
+        ):
+            ok_test, test_result = fetch_turbo_models(selected_key, base_url)
+            if ok_test:
+                st.session_state["turbo_api_status"] = {
+                    "state": "online",
+                    "label": "Online",
+                    "detail": f"{len(test_result)} modelo(s) disponiveis em {provider}.",
+                }
+                st.session_state[model_cache_key] = {"ok": True, "result": test_result}
+                st.rerun()
+            else:
+                st.session_state["turbo_api_status"] = {
+                    "state": "offline",
+                    "label": "Offline",
+                    "detail": test_result,
+                }
+                st.rerun()
+        if st.button(
             "Listar modelos disponiveis da API",
             use_container_width=True,
             key=f"list_models_{normalize_token_text(provider)}",
@@ -802,6 +862,12 @@ def render_turbo_ai_controls() -> dict:
         ):
             ok_models, model_result = fetch_turbo_models(selected_key, base_url)
             st.session_state[model_cache_key] = {"ok": ok_models, "result": model_result}
+            st.session_state["turbo_api_status"] = {
+                "state": "online" if ok_models else "offline",
+                "label": "Online" if ok_models else "Offline",
+                "detail": f"{len(model_result)} modelo(s) disponiveis em {provider}." if ok_models else model_result,
+            }
+            st.rerun()
         listed_models = st.session_state.get(model_cache_key)
         if listed_models:
             if listed_models.get("ok"):
