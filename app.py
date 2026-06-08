@@ -980,10 +980,8 @@ def call_turbo_ai(
     if not turbo_ai_available(turbo_config):
         return False, "Modo Turbo nao esta ativo. Informe uma chave API e ative o modo turbo na sidebar."
 
-    payload = {
+    base_payload = {
         "model": turbo_config.get("model", "gpt-4o-mini"),
-        "temperature": 0.2,
-        "max_tokens": max_tokens,
         "messages": [
             {
                 "role": "system",
@@ -1005,22 +1003,52 @@ def call_turbo_ai(
         ],
     }
     url = f"{str(turbo_config.get('base_url', 'https://api.openai.com/v1')).rstrip('/')}/chat/completions"
-    request = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {turbo_config.get('api_key')}",
-            "Content-Type": "application/json",
-        },
-        method="POST",
-    )
-    try:
+
+    def post_payload(payload: dict) -> dict:
+        request = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {turbo_config.get('api_key')}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
         with urllib.request.urlopen(request, timeout=45) as response:
-            result = json.loads(response.read().decode("utf-8"))
+            return json.loads(response.read().decode("utf-8"))
+
+    payload = dict(base_payload)
+    payload["max_completion_tokens"] = max_tokens
+    attempts = [payload]
+
+    try:
+        result = post_payload(payload)
         text = result.get("choices", [{}])[0].get("message", {}).get("content", "")
         return True, text.strip() or "A API respondeu sem texto utilizavel."
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="ignore")[:2000]
+        lower_detail = detail.lower()
+        retry_payload = None
+        if "max_completion_tokens" in lower_detail and "max_tokens" in lower_detail:
+            retry_payload = dict(base_payload)
+            retry_payload["max_tokens"] = max_tokens
+        elif "max_tokens" in lower_detail and "max_completion_tokens" in lower_detail:
+            retry_payload = dict(base_payload)
+            retry_payload["max_completion_tokens"] = max_tokens
+        elif "temperature" in lower_detail:
+            retry_payload = {k: v for k, v in payload.items() if k != "temperature"}
+
+        if retry_payload and retry_payload not in attempts:
+            try:
+                result = post_payload(retry_payload)
+                text = result.get("choices", [{}])[0].get("message", {}).get("content", "")
+                return True, text.strip() or "A API respondeu sem texto utilizavel."
+            except urllib.error.HTTPError as retry_exc:
+                detail = retry_exc.read().decode("utf-8", errors="ignore")[:2000]
+                return False, friendly_turbo_api_error(retry_exc.code, detail)
+            except Exception as retry_exc:
+                return False, f"Nao foi possivel acionar o Modo Turbo apos ajuste automatico: {str(retry_exc)[:500]}"
+
         return False, friendly_turbo_api_error(exc.code, detail)
     except Exception as exc:
         return False, f"Nao foi possivel acionar o Modo Turbo: {str(exc)[:500]}"
