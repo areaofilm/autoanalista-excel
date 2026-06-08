@@ -2179,11 +2179,19 @@ def build_dashboard_narrative(
     kpis: List[dict],
     active_filters: List[str],
     volume_col: Optional[str],
+    spreadsheet_profile: Optional[dict] = None,
 ) -> List[str]:
     notes = [
         f"A base atual contem {len(df):,} registros e {df.shape[1]} colunas.".replace(",", "."),
         f"O score de qualidade esta em {quality_report['score']:.1f}/100 ({quality_report['level']}).",
     ]
+    if spreadsheet_profile:
+        notes.insert(
+            0,
+            f"Tipo detectado: `{spreadsheet_profile.get('tipo', '-')}` "
+            f"({float(spreadsheet_profile.get('confianca', 0.0)):.1f}% de confianca). "
+            f"Melhor abordagem: {spreadsheet_profile.get('melhor_analise', '-')}",
+        )
 
     if active_filters:
         notes.append("Esta leitura considera filtros ativos no dashboard: " + " | ".join(active_filters[:3]) + ".")
@@ -2225,6 +2233,266 @@ def build_dashboard_narrative(
         )
 
     return notes[:8]
+
+
+ANALYTIC_DOMAIN_PROFILES = [
+    {
+        "tipo": "Atendimento / Chamados / Suporte",
+        "tokens": ["chamado", "ticket", "protocolo", "atendimento", "solicitacao", "status", "sla", "motivo", "causa", "problema", "prioridade", "encerramento", "abertura"],
+        "foco": "volume, status, fila, prioridade, tempo de atendimento, reincidencia e causa raiz.",
+        "analises": [
+            "Contar chamados/IDs unicos, nunca somar codigos.",
+            "Analisar status, motivos, cidade/equipe e evolucao temporal.",
+            "Priorizar gargalos por Pareto e verificar SLA ou tempo de resolucao quando existir.",
+        ],
+        "graficos": ["KPI de volume", "Pizza/status", "Pareto por motivo/cidade/equipe", "Serie temporal de chamados", "Boxplot de tempo/SLA"],
+        "dim_tokens": ["status", "motivo", "causa", "cidade", "equipe", "fila", "canal", "prioridade", "tipo"],
+        "metric_tokens": ["tempo", "sla", "prazo", "duracao", "dias", "horas", "nota"],
+    },
+    {
+        "tipo": "Financeiro / Faturamento / Cobranca",
+        "tokens": ["valor", "receita", "fatura", "boleto", "pagamento", "vencimento", "cobranca", "inadimplencia", "imposto", "custo", "despesa", "saldo", "liquido", "bruto"],
+        "foco": "valores, receitas/custos, vencimentos, inadimplencia, concentracao financeira e variacao no tempo.",
+        "analises": [
+            "Somar valores financeiros reais e separar IDs/codigos de metricas.",
+            "Comparar valores por periodo, categoria, cliente, cidade e status de pagamento.",
+            "Detectar outliers, negativos, vencidos e concentracao de receita/custo.",
+        ],
+        "graficos": ["Cards de valor total/media", "Ranking por categoria/cliente", "Serie temporal financeira", "Distribuicao de valores", "Correlacao entre metricas"],
+        "dim_tokens": ["status", "cliente", "cidade", "categoria", "tipo", "conta", "centro", "vendedor"],
+        "metric_tokens": ["valor", "receita", "custo", "despesa", "saldo", "liquido", "bruto", "imposto", "multa"],
+    },
+    {
+        "tipo": "Vendas / Comercial / Clientes",
+        "tokens": ["venda", "pedido", "cliente", "produto", "servico", "contrato", "vendedor", "funil", "lead", "proposta", "ticket", "receita", "cidade", "segmento"],
+        "foco": "volume de vendas, carteira, produtos, funil, ticket medio, canais e desempenho comercial.",
+        "analises": [
+            "Avaliar volume por vendedor/produto/cidade/canal.",
+            "Medir ticket medio, receita, conversao e concentracao por cliente ou segmento.",
+            "Comparar evolucao temporal e identificar oportunidades de crescimento.",
+        ],
+        "graficos": ["Ranking de vendas", "Pareto de produto/cliente", "Serie temporal", "Distribuicao de ticket", "Mapa de concentracao por segmento"],
+        "dim_tokens": ["cliente", "produto", "servico", "vendedor", "cidade", "canal", "segmento", "status"],
+        "metric_tokens": ["valor", "receita", "ticket", "quantidade", "qtd", "desconto"],
+    },
+    {
+        "tipo": "RH / Pessoas / Jornada",
+        "tokens": ["colaborador", "funcionario", "matricula", "cargo", "setor", "departamento", "admissao", "demissao", "salario", "ferias", "absenteismo", "treinamento"],
+        "foco": "headcount, movimentacoes, cargos, setores, custos, presenca e desenvolvimento.",
+        "analises": [
+            "Contar pessoas/matriculas unicas e segmentar por setor/cargo/local.",
+            "Analisar admissoes/desligamentos por periodo quando houver datas.",
+            "Monitorar ausencias, custos e concentracao por area.",
+        ],
+        "graficos": ["Headcount por setor", "Distribuicao por cargo", "Serie temporal de movimentacoes", "Boxplot salarial", "Qualidade cadastral"],
+        "dim_tokens": ["setor", "departamento", "cargo", "cidade", "unidade", "status"],
+        "metric_tokens": ["salario", "idade", "horas", "dias", "custo", "nota"],
+    },
+    {
+        "tipo": "Estoque / Inventario / Compras",
+        "tokens": ["estoque", "produto", "sku", "item", "quantidade", "qtd", "entrada", "saida", "compra", "fornecedor", "almoxarifado", "lote", "validade"],
+        "foco": "saldo, giro, ruptura, fornecedores, itens criticos e valor parado.",
+        "analises": [
+            "Avaliar quantidade/saldo por produto, fornecedor e local.",
+            "Identificar itens sem giro, baixo estoque, outliers e vencimentos.",
+            "Separar codigos/SKU de metricas reais de quantidade e valor.",
+        ],
+        "graficos": ["Ranking de itens", "Pareto por fornecedor", "Distribuicao de saldo", "Serie de entradas/saidas", "Alertas de baixo estoque"],
+        "dim_tokens": ["produto", "sku", "item", "fornecedor", "local", "categoria", "lote"],
+        "metric_tokens": ["quantidade", "qtd", "saldo", "valor", "custo", "entrada", "saida"],
+    },
+    {
+        "tipo": "Pesquisa / Satisfacao / Qualidade percebida",
+        "tokens": ["nota", "nps", "csat", "satisfacao", "avaliacao", "pesquisa", "resposta", "feedback", "comentario", "canal", "promotor", "detrator"],
+        "foco": "notas, experiencia, sentimento operacional, canais, motivos e evolucao da satisfacao.",
+        "analises": [
+            "Medir notas medias/medianas e distribuicao por faixa.",
+            "Segmentar por canal, cidade, equipe, produto ou motivo.",
+            "Identificar detratores, concentracoes e mudancas temporais.",
+        ],
+        "graficos": ["Distribuicao de notas", "Ranking por canal/cidade", "Serie temporal da nota", "Pareto de motivos", "Boxplot por segmento"],
+        "dim_tokens": ["canal", "cidade", "equipe", "produto", "motivo", "tipo", "status"],
+        "metric_tokens": ["nota", "nps", "csat", "satisfacao", "score"],
+    },
+    {
+        "tipo": "Qualidade / Auditoria / Conformidade",
+        "tokens": ["qualidade", "auditoria", "conformidade", "nao_conformidade", "nc", "erro", "falha", "risco", "criticidade", "plano", "acao", "evidencia"],
+        "foco": "nao conformidades, riscos, criticidade, recorrencia, responsaveis e plano de acao.",
+        "analises": [
+            "Contar ocorrencias e priorizar por criticidade/impacto.",
+            "Analisar recorrencia por area, responsavel, processo e causa.",
+            "Monitorar prazos, status do plano de acao e evolucao temporal.",
+        ],
+        "graficos": ["Riscos por criticidade", "Pareto de causas", "Status do plano", "Serie temporal de NCs", "Ranking por area"],
+        "dim_tokens": ["criticidade", "risco", "status", "area", "responsavel", "causa", "processo"],
+        "metric_tokens": ["prazo", "dias", "impacto", "score", "nota"],
+    },
+]
+
+
+def score_column_by_tokens(col: str, preferred_tokens: List[str]) -> int:
+    col_key = normalize_token_text(col)
+    tokens = set(col_key.split("_"))
+    score = 0
+    for i, token in enumerate(preferred_tokens):
+        weight = max(1, len(preferred_tokens) - i)
+        token_key = normalize_token_text(token)
+        if token_key in tokens or token_key in col_key:
+            score += weight
+    return score
+
+
+def pick_recommended_dimension(df: pd.DataFrame, groups: dict[str, List[str]], preferred_tokens: List[str]) -> Optional[str]:
+    candidates = []
+    id_like = set(detect_id_like_columns(df))
+    for col in groups.get("categorical", []):
+        if col in id_like:
+            continue
+        non_null = df[col].dropna()
+        if len(non_null) == 0:
+            continue
+        unique_count = int(non_null.nunique(dropna=True))
+        if unique_count < 2 or unique_count > max(120, int(len(non_null) * 0.6)):
+            continue
+        score = score_column_by_tokens(col, preferred_tokens)
+        coverage = float(len(non_null) / max(len(df), 1))
+        balance_bonus = 5 if 3 <= unique_count <= 30 else 2
+        candidates.append((score, coverage, balance_bonus, -unique_count, col))
+    if not candidates:
+        return groups.get("categorical", [None])[0] if groups.get("categorical") else None
+    return sorted(candidates, reverse=True)[0][-1]
+
+
+def pick_recommended_metric(df: pd.DataFrame, metric_numeric: List[str], preferred_tokens: List[str]) -> Optional[str]:
+    candidates = []
+    for col in metric_numeric:
+        non_null = pd.to_numeric(df[col], errors="coerce").dropna()
+        if len(non_null) == 0:
+            continue
+        variance = float(non_null.var()) if pd.notna(non_null.var()) else 0.0
+        candidates.append((score_column_by_tokens(col, preferred_tokens), len(non_null), variance, col))
+    if not candidates:
+        return None
+    return sorted(candidates, reverse=True)[0][-1]
+
+
+def detect_spreadsheet_profile(
+    df: pd.DataFrame,
+    groups: dict[str, List[str]],
+    quality_report: Optional[dict] = None,
+) -> dict:
+    metric_numeric, id_like_cols = select_numeric_metric_columns(df, groups)
+    volume_col = pick_volume_id_column(df, id_like_cols)
+    normalized_cols = {col: normalize_token_text(col) for col in df.columns}
+    profile_rows = []
+
+    for profile in ANALYTIC_DOMAIN_PROFILES:
+        score = 0
+        matched_cols: List[str] = []
+        for col, col_key in normalized_cols.items():
+            col_tokens = set(col_key.split("_"))
+            for token in profile["tokens"]:
+                token_key = normalize_token_text(token)
+                if token_key in col_tokens or token_key in col_key:
+                    score += 3 if token_key in col_tokens else 2
+                    matched_cols.append(col)
+                    break
+        if groups.get("datetime"):
+            score += 2
+        if metric_numeric:
+            score += 2
+        if volume_col and any(tok in normalize_token_text(volume_col) for tok in profile["tokens"]):
+            score += 3
+        profile_rows.append((score, profile, sorted(set(matched_cols))))
+
+    best_score, best_profile, matched_cols = sorted(profile_rows, key=lambda item: item[0], reverse=True)[0]
+    max_possible = max(10, min(36, len(df.columns) * 3))
+    confidence = max(0.15, min(0.98, best_score / max_possible))
+    if best_score < 5:
+        best_profile = {
+            "tipo": "Planilha geral / base mista",
+            "tokens": [],
+            "foco": "entender estrutura, qualidade, principais categorias, metricas numericas e possibilidade de tendencia temporal.",
+            "analises": [
+                "Comecar por qualidade, volumetria, categorias dominantes e metricas numericas reais.",
+                "Usar contagem para IDs/codigos e soma/media apenas para metricas de negocio.",
+                "Aplicar filtros para descobrir recortes relevantes antes de conclusoes gerenciais.",
+            ],
+            "graficos": ["Resumo de qualidade", "Top categorias", "Distribuicao numerica", "Serie temporal quando houver data", "Correlacao quando houver metricas"],
+            "dim_tokens": ["status", "categoria", "tipo", "cidade", "area", "produto", "cliente"],
+            "metric_tokens": ["valor", "quantidade", "qtd", "nota", "tempo", "dias"],
+        }
+        matched_cols = []
+        confidence = 0.35
+
+    recommended_dimension = pick_recommended_dimension(df, groups, best_profile.get("dim_tokens", []))
+    recommended_metric = pick_recommended_metric(df, metric_numeric, best_profile.get("metric_tokens", []))
+    recommended_date = max(groups["datetime"], key=lambda c: df[c].notna().sum()) if groups.get("datetime") else None
+
+    contains = [
+        f"{len(df):,} registros".replace(",", "."),
+        f"{df.shape[1]} colunas",
+        f"{len(groups.get('numeric', []))} numericas",
+        f"{len(groups.get('categorical', []))} categoricas",
+        f"{len(groups.get('datetime', []))} temporais",
+    ]
+    if volume_col:
+        contains.append(f"ID/volume principal: {volume_col}")
+    if recommended_dimension:
+        contains.append(f"dimensao recomendada: {recommended_dimension}")
+    if recommended_metric:
+        contains.append(f"metrica recomendada: {recommended_metric}")
+    if quality_report:
+        contains.append(f"qualidade: {float(quality_report.get('score', 0.0)):.1f}/100")
+
+    if recommended_metric:
+        best_analysis = f"Analisar `{recommended_metric}` por `{recommended_dimension}` e por periodo, usando ranking, distribuicao e tendencia."
+    elif volume_col:
+        best_analysis = f"Analisar contagem/IDs unicos de `{volume_col}` por `{recommended_dimension or 'categoria principal'}` e por periodo."
+    else:
+        best_analysis = f"Analisar volume de linhas por `{recommended_dimension or 'categoria principal'}` com foco em concentracao, qualidade e filtros."
+
+    return {
+        "tipo": best_profile["tipo"],
+        "confianca": round(float(confidence) * 100.0, 1),
+        "foco": best_profile["foco"],
+        "contem": contains,
+        "melhor_analise": best_analysis,
+        "analises_recomendadas": best_profile["analises"],
+        "graficos_recomendados": best_profile["graficos"],
+        "colunas_detectadas": matched_cols[:12],
+        "recommended_dimension": recommended_dimension,
+        "recommended_metric": recommended_metric,
+        "recommended_date": recommended_date,
+        "volume_col": volume_col,
+    }
+
+
+def render_spreadsheet_profile(profile: dict, key_prefix: str) -> None:
+    st.markdown("**Diagnostico inteligente da planilha**")
+    c1, c2, c3 = st.columns([1.1, 0.7, 2.0])
+    c1.metric("Tipo detectado", clean_report_text(profile.get("tipo", "-"), 42))
+    c2.metric("Confianca", f"{float(profile.get('confianca', 0.0)):.1f}%")
+    c3.info(clean_report_text(profile.get("melhor_analise", "-"), 320))
+
+    with st.expander("O que o AutoAnalista identificou e como vai analisar", expanded=True):
+        a, b, c = st.columns(3)
+        with a:
+            st.markdown("**O que contem**")
+            for item in profile.get("contem", [])[:8]:
+                st.caption(f"- {item}")
+        with b:
+            st.markdown("**Analises indicadas**")
+            for item in profile.get("analises_recomendadas", [])[:5]:
+                st.caption(f"- {item}")
+        with c:
+            st.markdown("**Graficos recomendados**")
+            for item in profile.get("graficos_recomendados", [])[:6]:
+                st.caption(f"- {item}")
+
+        matched = profile.get("colunas_detectadas", [])
+        if matched:
+            st.caption("Colunas que ajudaram na deteccao: " + ", ".join([clean_report_text(c, 40) for c in matched[:10]]))
 
 
 def build_numeric_distribution_table(df: pd.DataFrame, metric_numeric: List[str], preferred_metric: Optional[str] = None) -> pd.DataFrame:
@@ -2549,11 +2817,21 @@ def build_dashboard_export_bundle(
 ) -> dict:
     metric_numeric, id_like_cols = select_numeric_metric_columns(df, groups)
     volume_col = pick_volume_id_column(df, id_like_cols)
+    spreadsheet_profile = detect_spreadsheet_profile(df, groups, quality_report)
     dashboard_config = dashboard_config or {}
     configured_date = dashboard_config.get("date_col")
-    date_col = configured_date if configured_date in groups["datetime"] else (max(groups["datetime"], key=lambda c: df[c].notna().sum()) if groups["datetime"] else None)
+    preferred_date = spreadsheet_profile.get("recommended_date")
+    date_col = (
+        configured_date
+        if configured_date in groups["datetime"]
+        else preferred_date
+        if preferred_date in groups["datetime"]
+        else (max(groups["datetime"], key=lambda c: df[c].notna().sum()) if groups["datetime"] else None)
+    )
     configured_cat = dashboard_config.get("cat_col")
     configured_metric = dashboard_config.get("dist_col")
+    preferred_cat = spreadsheet_profile.get("recommended_dimension")
+    preferred_metric = spreadsheet_profile.get("recommended_metric")
     top_n = int(dashboard_config.get("top_n", 15) or 15)
     top_n = min(25, max(5, top_n))
     active_filters = active_filters or []
@@ -2577,9 +2855,24 @@ def build_dashboard_export_bundle(
         kpis,
         active_filters=active_filters,
         volume_col=volume_col,
+        spreadsheet_profile=spreadsheet_profile,
     )
     narrative_df = pd.DataFrame({"analise": narrative})
     filters_df = pd.DataFrame({"filtro": active_filters}) if active_filters else pd.DataFrame({"filtro": ["Nenhum filtro ativo no dashboard."]})
+    profile_df = pd.DataFrame(
+        [
+            {"campo": "tipo_detectado", "valor": spreadsheet_profile.get("tipo", "-")},
+            {"campo": "confianca_pct", "valor": spreadsheet_profile.get("confianca", 0.0)},
+            {"campo": "foco", "valor": spreadsheet_profile.get("foco", "-")},
+            {"campo": "melhor_analise", "valor": spreadsheet_profile.get("melhor_analise", "-")},
+            {"campo": "dimensao_recomendada", "valor": spreadsheet_profile.get("recommended_dimension", "-")},
+            {"campo": "metrica_recomendada", "valor": spreadsheet_profile.get("recommended_metric", "-")},
+            {"campo": "data_recomendada", "valor": spreadsheet_profile.get("recommended_date", "-")},
+            {"campo": "graficos_recomendados", "valor": "; ".join(spreadsheet_profile.get("graficos_recomendados", []))},
+            {"campo": "analises_recomendadas", "valor": "; ".join(spreadsheet_profile.get("analises_recomendadas", []))},
+            {"campo": "colunas_detectadas", "valor": ", ".join(spreadsheet_profile.get("colunas_detectadas", []))},
+        ]
+    )
 
     kpi_df = pd.DataFrame(
         [
@@ -2596,7 +2889,13 @@ def build_dashboard_export_bundle(
     top_categories_df = pd.DataFrame()
     metric_by_category_df = pd.DataFrame()
     if groups["categorical"]:
-        cat_col = configured_cat if configured_cat in groups["categorical"] else max(groups["categorical"], key=lambda c: df[c].notna().sum())
+        cat_col = (
+            configured_cat
+            if configured_cat in groups["categorical"]
+            else preferred_cat
+            if preferred_cat in groups["categorical"]
+            else max(groups["categorical"], key=lambda c: df[c].notna().sum())
+        )
         dist = df[cat_col].fillna("NULO").astype(str).value_counts().head(top_n).reset_index()
         dist.columns = ["categoria", "quantidade"]
         dist["coluna_categoria"] = cat_col
@@ -2604,7 +2903,13 @@ def build_dashboard_export_bundle(
         top_categories_df = dist[["coluna_categoria", "categoria", "quantidade", "participacao_pct"]]
 
         if metric_numeric:
-            metric_col = configured_metric if configured_metric in metric_numeric else max(metric_numeric, key=lambda c: df[c].notna().sum())
+            metric_col = (
+                configured_metric
+                if configured_metric in metric_numeric
+                else preferred_metric
+                if preferred_metric in metric_numeric
+                else max(metric_numeric, key=lambda c: df[c].notna().sum())
+            )
             grp = (
                 df[[cat_col, metric_col]]
                 .dropna(subset=[cat_col, metric_col])
@@ -2663,8 +2968,9 @@ def build_dashboard_export_bundle(
             trend["indicador"] = trend_label
             trend_df = trend[[date_col, "indicador", "valor"]]
 
-    distribution_metrics = ([configured_metric] if configured_metric in metric_numeric else []) + [c for c in metric_numeric if c != configured_metric]
-    numeric_distribution_df = build_numeric_distribution_table(df, distribution_metrics, preferred_metric=configured_metric)
+    distribution_preference = configured_metric if configured_metric in metric_numeric else preferred_metric
+    distribution_metrics = ([distribution_preference] if distribution_preference in metric_numeric else []) + [c for c in metric_numeric if c != distribution_preference]
+    numeric_distribution_df = build_numeric_distribution_table(df, distribution_metrics, preferred_metric=distribution_preference)
     analytic_reading = build_analytic_reading(
         df,
         groups,
@@ -2679,6 +2985,7 @@ def build_dashboard_export_bundle(
     return {
         "summary_df": summary_df,
         "narrative_df": narrative_df,
+        "profile_df": profile_df,
         "analytic_reading_df": analytic_reading_df,
         "filters_df": filters_df,
         "kpi_df": kpi_df,
@@ -2816,6 +3123,8 @@ def render_management_dashboard(
     metric_numeric, id_like_cols = select_numeric_metric_columns(dashboard_df, dash_groups)
     volume_col = pick_volume_id_column(dashboard_df, id_like_cols)
     dash_kpis = detect_kpis(dashboard_df, dash_groups) or kpis
+    spreadsheet_profile = detect_spreadsheet_profile(dashboard_df, dash_groups, quality_report)
+    st.session_state[f"{key_prefix}_profile"] = spreadsheet_profile
 
     critical_or_high = (
         issue_catalog["priority"].astype(str).str.lower().isin(["critical", "high"]).sum()
@@ -2832,6 +3141,7 @@ def render_management_dashboard(
     c5.metric("Violacoes/linha", f"{violation_ratio:.1f}%")
     c6.metric("Linhas saneadas", int(treatment_report.get("total_removed", 0)))
 
+    render_spreadsheet_profile(spreadsheet_profile, key_prefix)
     render_treatment_summary(treatment_report, key_prefix=f"{key_prefix}_treatment")
 
     st.markdown("**Analise automatica da planilha**")
@@ -2843,6 +3153,7 @@ def render_management_dashboard(
         dash_kpis,
         dashboard_filters,
         volume_col,
+        spreadsheet_profile=spreadsheet_profile,
     )
     for note in dashboard_notes:
         st.markdown(f"- {note}")
@@ -2864,10 +3175,17 @@ def render_management_dashboard(
 
     st.markdown("**Explorador visual interativo**")
     controls = st.columns([1.2, 1, 1.2, 1.2, 1])
+    preferred_cat = spreadsheet_profile.get("recommended_dimension")
+    preferred_date = spreadsheet_profile.get("recommended_date")
+    preferred_metric = spreadsheet_profile.get("recommended_metric")
+    cat_index = dash_groups["categorical"].index(preferred_cat) if preferred_cat in dash_groups["categorical"] else 0
+    date_index = dash_groups["datetime"].index(preferred_date) if preferred_date in dash_groups["datetime"] else 0
+    metric_index = metric_numeric.index(preferred_metric) if preferred_metric in metric_numeric else 0
     cat_col = (
         controls[0].selectbox(
             "Dimensao categorica",
             options=dash_groups["categorical"],
+            index=cat_index,
             key=f"{key_prefix}_cat_dim",
         )
         if dash_groups["categorical"]
@@ -2878,6 +3196,7 @@ def render_management_dashboard(
         controls[2].selectbox(
             "Coluna temporal",
             options=dash_groups["datetime"],
+            index=date_index,
             key=f"{key_prefix}_date_dim",
         )
         if dash_groups["datetime"]
@@ -2887,6 +3206,7 @@ def render_management_dashboard(
         controls[3].selectbox(
             "Metrica numerica principal",
             options=metric_numeric,
+            index=metric_index,
             key=f"{key_prefix}_primary_metric",
         )
         if metric_numeric
@@ -4153,6 +4473,23 @@ def generate_powerpoint_report(
     else:
         ppt_add_bullets(slide, ["Dashboard nao preparado para esta exportacao."])
 
+    if dashboard_bundle:
+        profile_df = dashboard_bundle.get("profile_df", pd.DataFrame())
+        if len(profile_df) > 0:
+            profile_map = dict(zip(profile_df.get("campo", []), profile_df.get("valor", [])))
+            slide = prs.slides.add_slide(prs.slide_layouts[1])
+            ppt_add_title(slide, "Perfil Inteligente da Planilha", "Tipo detectado e melhor abordagem analitica")
+            ppt_add_bullets(
+                slide,
+                [
+                    f"Tipo detectado: {profile_map.get('tipo_detectado', '-')}",
+                    f"Confianca: {profile_map.get('confianca_pct', '-')}%",
+                    f"Foco recomendado: {profile_map.get('foco', '-')}",
+                    f"Melhor analise: {profile_map.get('melhor_analise', '-')}",
+                    f"Graficos indicados: {profile_map.get('graficos_recomendados', '-')}",
+                ],
+            )
+
     slide = prs.slides.add_slide(prs.slide_layouts[1])
     ppt_add_title(slide, "Qualidade e Riscos", "Principais pontos de atencao")
     risk_bullets = []
@@ -4275,6 +4612,7 @@ def generate_excel_export(
         pd.DataFrame({"acao_recomendada": recommendations}).to_excel(writer, sheet_name="recomendacoes", index=False)
         if dashboard_bundle:
             dashboard_bundle.get("summary_df", pd.DataFrame()).to_excel(writer, sheet_name="dash_resumo", index=False)
+            dashboard_bundle.get("profile_df", pd.DataFrame()).to_excel(writer, sheet_name="dash_perfil", index=False)
             dashboard_bundle.get("filters_df", pd.DataFrame()).to_excel(writer, sheet_name="dash_filtros", index=False)
             dashboard_bundle.get("narrative_df", pd.DataFrame()).to_excel(writer, sheet_name="dash_narrativa", index=False)
             dashboard_bundle.get("analytic_reading_df", pd.DataFrame()).to_excel(writer, sheet_name="dash_leitura", index=False)
@@ -4645,6 +4983,21 @@ def build_pdf_report(
     if dashboard_bundle:
         story.append(PageBreak())
         story.append(pdf_paragraph("Analise do Dashboard", styles["Heading2"]))
+        profile_df = dashboard_bundle.get("profile_df", pd.DataFrame())
+        if len(profile_df) > 0:
+            profile_map = dict(zip(profile_df.get("campo", []), profile_df.get("valor", [])))
+            story.append(pdf_paragraph("Perfil automatico da planilha", styles["Heading3"]))
+            profile_data = [
+                ["Campo", "Leitura"],
+                ["Tipo detectado", profile_map.get("tipo_detectado", "-")],
+                ["Confianca", f"{profile_map.get('confianca_pct', '-')}%"],
+                ["Foco recomendado", profile_map.get("foco", "-")],
+                ["Melhor analise", profile_map.get("melhor_analise", "-")],
+                ["Graficos indicados", profile_map.get("graficos_recomendados", "-")],
+            ]
+            story.append(pdf_table(profile_data, [130, 350], header_color="#0F6E9A", font_size=7))
+            story.append(Spacer(1, 6))
+
         filters_df = dashboard_bundle.get("filters_df", pd.DataFrame())
         if len(filters_df) > 0:
             story.append(pdf_paragraph("Filtros do Dashboard registrados", styles["Heading3"]))
