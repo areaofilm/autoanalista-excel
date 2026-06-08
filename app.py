@@ -1143,7 +1143,12 @@ def render_turbo_ai_box(
     if st.button(button_label, use_container_width=True, key=f"turbo_btn_{cache_key}"):
         with st.spinner("Modo Turbo analisando os dados agregados..."):
             ok, text = call_turbo_ai(turbo_config, section=section, context=context, instruction=instruction)
-        st.session_state[f"turbo_result_{cache_key}"] = {"ok": ok, "text": text}
+        st.session_state[f"turbo_result_{cache_key}"] = {
+            "ok": ok,
+            "text": text,
+            "section": section,
+            "generated_at": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
+        }
     result = st.session_state.get(f"turbo_result_{cache_key}")
     if result:
         if result.get("ok"):
@@ -1152,6 +1157,53 @@ def render_turbo_ai_box(
         else:
             st.warning(result.get("text", "Falha ao gerar analise Turbo."))
             st.caption("O AutoAnalista continua operando normalmente com as analises locais, dashboards, insights e ML sem API.")
+
+
+def collect_turbo_reports(analysis_key: str) -> List[dict]:
+    reports = []
+    seen = set()
+    section_order = {"Dashboard": 0, "Insights": 1, "Machine Learning": 2}
+    for key, value in st.session_state.items():
+        if not str(key).startswith("turbo_result_") or not isinstance(value, dict):
+            continue
+        if not value.get("ok") or not value.get("text"):
+            continue
+        raw_key = str(key).replace("turbo_result_", "", 1)
+        if analysis_key not in raw_key:
+            continue
+        section = value.get("section")
+        if not section:
+            section = "Dashboard" if raw_key.startswith("dash_") else "Insights" if raw_key.startswith("insights_") else "Machine Learning" if raw_key.startswith("ml_") else "IA"
+        dedupe_key = (section, value.get("text", "")[:180])
+        if dedupe_key in seen:
+            continue
+        reports.append(
+            {
+                "section": section,
+                "text": str(value.get("text", "")),
+                "generated_at": value.get("generated_at", ""),
+            }
+        )
+        seen.add(dedupe_key)
+    return sorted(reports, key=lambda item: section_order.get(item.get("section", ""), 99))
+
+
+def turbo_text_to_lines(text: str, limit: int = 12) -> List[str]:
+    lines = []
+    for raw in str(text).replace("\r", "\n").split("\n"):
+        item = raw.strip()
+        if not item:
+            continue
+        item = re.sub(r"^#{1,6}\s*", "", item)
+        item = re.sub(r"^[-*•]\s*", "", item)
+        item = re.sub(r"^\d+[\.)]\s*", "", item)
+        if item:
+            lines.append(item)
+        if len(lines) >= limit:
+            break
+    if not lines and text:
+        lines = [str(text)]
+    return lines[:limit]
 
 
 def render_database_controls(role: str) -> None:
@@ -5206,6 +5258,7 @@ def generate_powerpoint_report(
     treatment_report: dict,
     ml_sup: Optional[dict],
     version: int,
+    ai_reports: Optional[List[dict]] = None,
 ) -> bytes:
     if Presentation is None:
         raise RuntimeError("Dependencia python-pptx nao instalada.")
@@ -5284,6 +5337,14 @@ def generate_powerpoint_report(
     else:
         bullets = ["Modelo supervisionado nao executado nesta analise."]
     ppt_add_bullets(slide, bullets)
+
+    for report in (ai_reports or [])[:3]:
+        slide = prs.slides.add_slide(prs.slide_layouts[1])
+        ppt_add_title(slide, f"Analise Turbo IA - {report.get('section', 'IA')}", "Leitura gerada por API opcional")
+        bullets = turbo_text_to_lines(report.get("text", ""), limit=7)
+        if report.get("generated_at"):
+            bullets.insert(0, f"Gerado em: {report.get('generated_at')}")
+        ppt_add_bullets(slide, bullets)
 
     buffer = io.BytesIO()
     prs.save(buffer)
@@ -5592,6 +5653,7 @@ def build_pdf_report(
     treatment_report: Optional[dict] = None,
     active_filters: Optional[List[str]] = None,
     area: str = "Geral",
+    ai_reports: Optional[List[dict]] = None,
 ) -> bytes:
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=A4, leftMargin=36, rightMargin=36, topMargin=36, bottomMargin=36)
@@ -5666,6 +5728,24 @@ def build_pdf_report(
             for _, row in analytic_df.head(6).iterrows():
                 story.append(pdf_paragraph(f"- {row.get('leitura_analitica', '-')}", styles["Normal"]))
             story.append(Spacer(1, 8))
+
+    if ai_reports:
+        story.append(pdf_paragraph("Analise Turbo IA", styles["Heading2"]))
+        story.append(
+            pdf_paragraph(
+                "Conteudo gerado por API opcional a partir de dados agregados da analise. Use como apoio consultivo e valide decisoes criticas com o negocio.",
+                styles["Normal"],
+            )
+        )
+        for report in ai_reports[:4]:
+            title = f"{report.get('section', 'IA')}"
+            if report.get("generated_at"):
+                title += f" | {report.get('generated_at')}"
+            story.append(pdf_paragraph(title, styles["Heading3"]))
+            for line in turbo_text_to_lines(report.get("text", ""), limit=14):
+                story.append(pdf_paragraph(f"- {line}", styles["Normal"]))
+            story.append(Spacer(1, 5))
+        story.append(Spacer(1, 8))
 
     story.append(pdf_paragraph("Plano de acao gerencial", styles["Heading2"]))
     action_data = [["Prioridade", "Problema", "Impacto", "Acao", "Responsavel", "Prazo"]]
@@ -6767,6 +6847,7 @@ def main() -> None:
                     dashboard_top_corr = strongest_correlations(dashboard_report_df, top_n=10)
                     report_filters = [f"Global - {item}" for item in active_filters]
                     report_filters.extend([f"Dashboard - {item}" for item in dashboard_filters_for_report])
+                    ai_reports = collect_turbo_reports(analysis_key)
                     dashboard_bundle = build_dashboard_export_bundle(
                         dashboard_report_df,
                         dashboard_report_groups,
@@ -6809,6 +6890,7 @@ def main() -> None:
                         treatment_report=treatment_report,
                         active_filters=report_filters,
                         area=area,
+                        ai_reports=ai_reports,
                     )
                     try:
                         pptx_bytes = generate_powerpoint_report(
@@ -6821,6 +6903,7 @@ def main() -> None:
                             treatment_report=treatment_report,
                             ml_sup=ml_sup,
                             version=version,
+                            ai_reports=ai_reports,
                         )
                     except Exception as exc:
                         pptx_bytes = b""
