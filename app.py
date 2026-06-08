@@ -735,9 +735,26 @@ def friendly_turbo_api_error(status_code: int, detail: str) -> str:
     except Exception:
         payload = {}
     error = payload.get("error", {}) if isinstance(payload, dict) else {}
-    code = str(error.get("code", "") or "")
-    err_type = str(error.get("type", "") or "")
-    message = str(error.get("message", "") or detail)
+    if isinstance(error, dict):
+        code = str(error.get("code", "") or "")
+        err_type = str(error.get("type", "") or "")
+        message = str(error.get("message", "") or detail)
+    elif isinstance(error, list):
+        code = ""
+        err_type = ""
+        message = " | ".join([str(item) for item in error[:3]]) or detail
+    elif error:
+        code = ""
+        err_type = ""
+        message = str(error)
+    elif isinstance(payload, dict):
+        code = str(payload.get("code", "") or "")
+        err_type = str(payload.get("type", "") or "")
+        message = str(payload.get("message", "") or detail)
+    else:
+        code = ""
+        err_type = ""
+        message = detail
 
     if status_code == 429 and (code == "insufficient_quota" or "quota" in message.lower()):
         return (
@@ -761,7 +778,8 @@ def friendly_turbo_api_error(status_code: int, detail: str) -> str:
     if status_code == 404 or "model" in code:
         return (
             "**Modelo nao encontrado ou sem permissao.**\n\n"
-            "Tente usar `gpt-4o-mini` na configuracao avancada do Modo Turbo."
+            "Se estiver usando OpenAI, tente `gpt-4o-mini`. "
+            "Se estiver usando Grok/xAI, tente um modelo disponivel no seu console, como `grok-4` ou `grok-3-mini`."
         )
     if status_code >= 500:
         return (
