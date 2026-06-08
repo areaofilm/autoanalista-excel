@@ -39,7 +39,7 @@ except Exception:  # pragma: no cover - optional until dependency is installed
 from sklearn.cluster import KMeans
 from sklearn.compose import ColumnTransformer
 from sklearn.decomposition import PCA
-from sklearn.ensemble import IsolationForest, RandomForestClassifier, RandomForestRegressor
+from sklearn.ensemble import GradientBoostingClassifier, GradientBoostingRegressor, IsolationForest, RandomForestClassifier, RandomForestRegressor
 from sklearn.impute import SimpleImputer
 from sklearn.inspection import permutation_importance
 from sklearn.linear_model import LinearRegression, LogisticRegression
@@ -3378,6 +3378,8 @@ def ml_business_explanation(result: dict) -> List[str]:
     model = result.get("model_choice", "modelo")
     kind = result.get("problem_type", "-")
     bullets = [f"O modelo `{model}` foi treinado para prever `{target}` usando as demais colunas validas da planilha."]
+    if result.get("requested_model_choice") == "Auto (comparar modelos)":
+        bullets.append("A opcao automatica comparou modelos por validacao cruzada e manteve o melhor desempenho para o treino final.")
     if kind == "classification":
         bullets.append(
             f"Como o alvo e categorico, a leitura principal e F1/acuracia. F1 holdout: {float(result.get('holdout_f1', 0.0)):.3f}."
@@ -3410,6 +3412,111 @@ def public_ml_summary(result: Optional[dict]) -> dict:
         return {}
     hidden_keys = {"pipeline"}
     return {k: v for k, v in result.items() if k not in hidden_keys}
+
+
+def get_classification_candidates() -> List[Tuple[str, object]]:
+    return [
+        ("Random Forest", RandomForestClassifier(n_estimators=300, random_state=SEED, class_weight="balanced_subsample")),
+        ("Regressao Logistica", LogisticRegression(max_iter=1000, class_weight="balanced", random_state=SEED)),
+        ("Gradient Boosting", GradientBoostingClassifier(random_state=SEED)),
+    ]
+
+
+def get_regression_candidates() -> List[Tuple[str, object]]:
+    return [
+        ("Random Forest", RandomForestRegressor(n_estimators=300, random_state=SEED)),
+        ("Regressao Linear", LinearRegression()),
+        ("Gradient Boosting", GradientBoostingRegressor(random_state=SEED)),
+    ]
+
+
+def select_model_candidates(problem_type: str, model_choice: str) -> List[Tuple[str, object]]:
+    if problem_type == "classification":
+        candidates = get_classification_candidates()
+        manual_alias = "Regressao Logistica"
+    else:
+        candidates = get_regression_candidates()
+        manual_alias = "Regressao Linear"
+
+    if model_choice == "Auto (comparar modelos)":
+        return candidates
+    if model_choice == "Random Forest":
+        return [item for item in candidates if item[0] == "Random Forest"]
+    if model_choice == "Regressao Linear / Logistica":
+        return [item for item in candidates if item[0] == manual_alias]
+    return candidates[:1]
+
+
+def compare_model_candidates(
+    *,
+    x: pd.DataFrame,
+    y: pd.Series,
+    preprocess: ColumnTransformer,
+    candidates: List[Tuple[str, object]],
+    cv_folds: int,
+    problem_type: str,
+) -> Tuple[str, object, pd.DataFrame]:
+    rows = []
+    best_name = candidates[0][0]
+    best_model = candidates[0][1]
+    best_score = -np.inf
+
+    for name, model in candidates:
+        pipe = Pipeline(steps=[("preprocess", preprocess), ("model", model)])
+        try:
+            if problem_type == "classification":
+                cv = cross_validate(pipe, x, y, cv=cv_folds, scoring={"acc": "accuracy", "f1": "f1_weighted"}, error_score="raise")
+                score = float(np.mean(cv["test_f1"]))
+                rows.append(
+                    {
+                        "modelo": name,
+                        "metrica_principal": "F1 ponderado",
+                        "score": score,
+                        "acuracia_cv": float(np.mean(cv["test_acc"])),
+                        "f1_cv": score,
+                        "status": "ok",
+                    }
+                )
+            else:
+                cv = cross_validate(
+                    pipe,
+                    x,
+                    y,
+                    cv=cv_folds,
+                    scoring={"r2": "r2", "rmse": "neg_root_mean_squared_error", "mae": "neg_mean_absolute_error"},
+                    error_score="raise",
+                )
+                score = float(np.mean(cv["test_r2"]))
+                rows.append(
+                    {
+                        "modelo": name,
+                        "metrica_principal": "R2",
+                        "score": score,
+                        "r2_cv": score,
+                        "rmse_cv": float(-np.mean(cv["test_rmse"])),
+                        "mae_cv": float(-np.mean(cv["test_mae"])),
+                        "status": "ok",
+                    }
+                )
+            if score > best_score:
+                best_score = score
+                best_name = name
+                best_model = model
+        except Exception as exc:
+            rows.append(
+                {
+                    "modelo": name,
+                    "metrica_principal": "erro",
+                    "score": None,
+                    "status": f"falhou: {str(exc)[:120]}",
+                }
+            )
+
+    comparison_df = pd.DataFrame(rows)
+    if len(comparison_df) > 0 and "score" in comparison_df.columns:
+        comparison_df = comparison_df.sort_values("score", ascending=False, na_position="last")
+        comparison_df = comparison_df.astype(object).where(pd.notna(comparison_df), None)
+    return best_name, best_model, comparison_df
 
 
 def sanitize_ml_features(x: pd.DataFrame) -> Tuple[pd.DataFrame, List[str], List[str], List[dict]]:
@@ -3526,10 +3633,26 @@ def run_supervised_ml(
             return None
         estimated_test_rows = max(1, int(np.ceil(len(y) * 0.2)))
         strat = y if min_count >= 2 and y.nunique(dropna=True) <= min(30, estimated_test_rows) else None
-        if model_choice == "Regressao Linear / Logistica":
-            model = LogisticRegression(max_iter=1000, class_weight="balanced", random_state=SEED)
+        candidates = select_model_candidates("classification", model_choice)
+        selected_model_name, model, comparison_df = compare_model_candidates(
+            x=x,
+            y=y,
+            preprocess=preprocess,
+            candidates=candidates,
+            cv_folds=cv_folds,
+            problem_type="classification",
+        )
+        if comparison_df.empty or not (comparison_df.get("status") == "ok").any():
+            st.error("Nenhum modelo de classificacao conseguiu treinar com esta configuracao.")
+            if len(comparison_df) > 0:
+                st.dataframe(comparison_df, use_container_width=True)
+            return None
+        if model_choice == "Auto (comparar modelos)":
+            st.markdown("**Comparacao automatica de modelos**")
+            st.dataframe(comparison_df, use_container_width=True)
+            st.success(f"Melhor modelo selecionado: `{selected_model_name}`.")
         else:
-            model = RandomForestClassifier(n_estimators=300, random_state=SEED, class_weight="balanced_subsample")
+            st.caption(f"Modelo treinado: `{selected_model_name}`.")
         pipe = Pipeline(steps=[("preprocess", preprocess), ("model", model)])
         try:
             cv = cross_validate(pipe, x, y, cv=cv_folds, scoring={"acc": "accuracy", "f1": "f1_weighted"}, error_score="raise")
@@ -3571,8 +3694,10 @@ def run_supervised_ml(
         return {
             "problem_type": "classification",
             "target_col": target_col,
-            "model_choice": model_choice,
+            "model_choice": selected_model_name,
+            "requested_model_choice": model_choice,
             **metrics,
+            "model_comparison": comparison_df.to_dict("records"),
             "removed_leakage_features": leak_cols,
             "feature_importance": serialize_feature_importance(imp_df),
             "model_reliability_alert": ml_reliability_alert("classification", metrics),
@@ -3582,11 +3707,6 @@ def run_supervised_ml(
         }
 
     cv_folds = 5 if len(x) >= 100 else 3
-    if model_choice == "Regressao Linear / Logistica":
-        model = LinearRegression()
-    else:
-        model = RandomForestRegressor(n_estimators=300, random_state=SEED)
-    pipe = Pipeline(steps=[("preprocess", preprocess), ("model", model)])
     try:
         y = pd.to_numeric(y, errors="coerce")
         valid_target = y.notna()
@@ -3595,6 +3715,27 @@ def run_supervised_ml(
         if len(x) < 30:
             st.warning("Poucos registros com alvo numerico valido para regressao (minimo recomendado: 30).")
             return None
+        candidates = select_model_candidates("regression", model_choice)
+        selected_model_name, model, comparison_df = compare_model_candidates(
+            x=x,
+            y=y,
+            preprocess=preprocess,
+            candidates=candidates,
+            cv_folds=cv_folds,
+            problem_type="regression",
+        )
+        if comparison_df.empty or not (comparison_df.get("status") == "ok").any():
+            st.error("Nenhum modelo de regressao conseguiu treinar com esta configuracao.")
+            if len(comparison_df) > 0:
+                st.dataframe(comparison_df, use_container_width=True)
+            return None
+        if model_choice == "Auto (comparar modelos)":
+            st.markdown("**Comparacao automatica de modelos**")
+            st.dataframe(comparison_df, use_container_width=True)
+            st.success(f"Melhor modelo selecionado: `{selected_model_name}`.")
+        else:
+            st.caption(f"Modelo treinado: `{selected_model_name}`.")
+        pipe = Pipeline(steps=[("preprocess", preprocess), ("model", model)])
         cv = cross_validate(
             pipe,
             x,
@@ -3649,8 +3790,10 @@ def run_supervised_ml(
     return {
         "problem_type": "regression",
         "target_col": target_col,
-        "model_choice": model_choice,
+        "model_choice": selected_model_name,
+        "requested_model_choice": model_choice,
         **metrics,
+        "model_comparison": comparison_df.to_dict("records"),
         "removed_leakage_features": leak_cols,
         "feature_importance": serialize_feature_importance(imp_df),
         "model_reliability_alert": ml_reliability_alert("regression", metrics),
@@ -4029,6 +4172,8 @@ def generate_powerpoint_report(
     ppt_add_title(slide, "Machine Learning", "Resultado preditivo quando disponivel")
     if ml_sup:
         bullets = [f"Modelo: {ml_sup.get('model_choice', '-')}", f"Alvo: {ml_sup.get('target_col', '-')}"]
+        if ml_sup.get("requested_model_choice") == "Auto (comparar modelos)":
+            bullets.append("Selecao automatica: modelos comparados por validacao cruzada.")
         if ml_sup.get("problem_type") == "classification":
             bullets.append(f"F1 holdout: {ml_sup.get('holdout_f1', 0):.3f}")
         else:
@@ -4626,6 +4771,33 @@ def build_pdf_report(
                     styles["Normal"],
                 )
             )
+        business_notes = ml_business_explanation(ml_sup)
+        if business_notes:
+            story.append(pdf_paragraph("Leitura gerencial do ML", styles["Heading3"]))
+            for note in business_notes[:5]:
+                story.append(pdf_paragraph("- " + note, styles["Normal"]))
+        model_comparison = ml_sup.get("model_comparison", [])
+        if model_comparison:
+            comparison_df = pd.DataFrame(model_comparison)
+            if len(comparison_df) > 0:
+                story.append(pdf_paragraph("Comparacao de modelos testados", styles["Heading3"]))
+                if ml_sup.get("problem_type") == "classification":
+                    preferred_cols = ["modelo", "f1_cv", "acuracia_cv", "status"]
+                    header_map = {"modelo": "Modelo", "f1_cv": "F1 CV", "acuracia_cv": "Acuracia CV", "status": "Status"}
+                else:
+                    preferred_cols = ["modelo", "r2_cv", "rmse_cv", "mae_cv", "status"]
+                    header_map = {"modelo": "Modelo", "r2_cv": "R2 CV", "rmse_cv": "RMSE CV", "mae_cv": "MAE CV", "status": "Status"}
+                available_cols = [c for c in preferred_cols if c in comparison_df.columns]
+                if available_cols:
+                    model_data = [[header_map.get(c, c) for c in available_cols]]
+                    for _, row in comparison_df[available_cols].head(6).iterrows():
+                        model_data.append(
+                            [
+                                f"{float(value):.3f}" if isinstance(value, (int, float, np.floating)) and pd.notna(value) else value
+                                for value in row.tolist()
+                            ]
+                        )
+                    story.append(pdf_table(model_data, [120, 75, 75, 75, 95][: len(available_cols)], header_color="#334155", font_size=7))
         if ml_sup.get("model_reliability_alert"):
             story.append(pdf_paragraph("Alerta de confiabilidade: " + ml_sup["model_reliability_alert"], styles["Normal"]))
         feature_importance = ml_sup.get("feature_importance", [])
@@ -4642,6 +4814,30 @@ def build_pdf_report(
                     styles["Normal"],
                 )
             )
+        if ml_sup.get("problem_type") == "classification" and ml_sup.get("confusion_matrix"):
+            cm_df = pd.DataFrame(ml_sup["confusion_matrix"])
+            if len(cm_df) > 0:
+                story.append(pdf_paragraph("Matriz de confusao do holdout", styles["Heading3"]))
+                cm_cols = cm_df.columns.tolist()[:7]
+                cm_data = [cm_cols]
+                for _, row in cm_df[cm_cols].head(10).iterrows():
+                    cm_data.append(row.tolist())
+                story.append(pdf_table(cm_data, [95] + [55] * (len(cm_cols) - 1), header_color="#7A4EAB", font_size=6))
+        if ml_sup.get("problem_type") == "regression" and ml_sup.get("prediction_sample"):
+            pred_df = pd.DataFrame(ml_sup["prediction_sample"])
+            if len(pred_df) > 0:
+                story.append(pdf_paragraph("Amostra real vs previsto", styles["Heading3"]))
+                pred_cols = [c for c in ["real", "previsto", "erro"] if c in pred_df.columns]
+                pred_data = [["Real", "Previsto", "Erro"][: len(pred_cols)]]
+                for _, row in pred_df[pred_cols].head(10).iterrows():
+                    pred_data.append([f"{float(value):.3f}" if pd.notna(value) else "-" for value in row.tolist()])
+                story.append(pdf_table(pred_data, [110, 110, 110][: len(pred_cols)], header_color="#0F6E9A", font_size=8))
+        story.append(
+            pdf_paragraph(
+                "Nota: os resultados de ML devem ser usados como apoio a decisao. Para uso operacional critico, valide o modelo com dados historicos, regras de negocio e acompanhamento recorrente.",
+                styles["Normal"],
+            )
+        )
     else:
         story.append(pdf_paragraph("Sem resultado supervisionado.", styles["Normal"]))
 
@@ -4888,7 +5084,7 @@ def main() -> None:
     )
 
     target_options = ["(nao usar)"] + analysis_df.columns.tolist()
-    model_options = ["Random Forest", "Regressao Linear / Logistica"]
+    model_options = ["Auto (comparar modelos)", "Random Forest", "Regressao Linear / Logistica"]
     ml_target_suggestions = suggest_ml_targets(analysis_df, groups)
     best_ml_target = ml_target_suggestions[0]["coluna"] if ml_target_suggestions else None
     target_state_key = f"predictive_target_value_{analysis_key}"
@@ -4901,7 +5097,7 @@ def main() -> None:
     if st.session_state.get(target_state_key) not in target_options:
         st.session_state[target_state_key] = "(nao usar)"
     if st.session_state.get(model_state_key) not in model_options:
-        st.session_state[model_state_key] = "Random Forest"
+        st.session_state[model_state_key] = "Auto (comparar modelos)"
     for widget_key in [target_sidebar_key, target_tab_key]:
         if st.session_state.get(widget_key) not in target_options:
             st.session_state[widget_key] = st.session_state[target_state_key]
@@ -5160,6 +5356,10 @@ def main() -> None:
                 st.markdown("**Explicacao gerencial do modelo**")
                 for item in ml_business_explanation(ml_sup):
                     st.markdown(f"- {item}")
+
+                if ml_sup.get("model_comparison"):
+                    st.markdown("**Comparacao dos modelos avaliados**")
+                    st.dataframe(pd.DataFrame(ml_sup["model_comparison"]), use_container_width=True)
 
                 if ml_sup.get("problem_type") == "classification" and ml_sup.get("confusion_matrix"):
                     st.markdown("**Matriz de confusao salva do holdout**")
