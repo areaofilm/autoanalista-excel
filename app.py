@@ -729,6 +729,48 @@ def turbo_ai_available(turbo_config: Optional[dict]) -> bool:
     return bool(turbo_config and turbo_config.get("enabled") and turbo_config.get("api_key"))
 
 
+def friendly_turbo_api_error(status_code: int, detail: str) -> str:
+    try:
+        payload = json.loads(detail)
+    except Exception:
+        payload = {}
+    error = payload.get("error", {}) if isinstance(payload, dict) else {}
+    code = str(error.get("code", "") or "")
+    err_type = str(error.get("type", "") or "")
+    message = str(error.get("message", "") or detail)
+
+    if status_code == 429 and (code == "insufficient_quota" or "quota" in message.lower()):
+        return (
+            "**Modo Turbo indisponivel por cota da API.**\n\n"
+            "A chave foi aceita, mas a conta/projeto da API esta sem creditos, sem billing ativo ou excedeu a cota atual.\n\n"
+            "**Como resolver:**\n"
+            "- Verifique saldo, billing e limites do projeto no painel da API.\n"
+            "- Use outra chave API com cota disponivel.\n"
+            "- Ou desligue o Modo Turbo e continue usando a analise local normalmente."
+        )
+    if status_code in [401, 403] or code in ["invalid_api_key", "invalid_api_key_format"]:
+        return (
+            "**Chave API recusada.**\n\n"
+            "Confira se a chave foi copiada corretamente, se pertence ao projeto certo e se possui permissao para usar o modelo selecionado."
+        )
+    if status_code == 429 or "rate_limit" in code or "rate_limit" in err_type:
+        return (
+            "**Limite temporario da API atingido.**\n\n"
+            "Aguarde alguns instantes e tente novamente, ou reduza a frequencia das chamadas Turbo."
+        )
+    if status_code == 404 or "model" in code:
+        return (
+            "**Modelo nao encontrado ou sem permissao.**\n\n"
+            "Tente usar `gpt-4o-mini` na configuracao avancada do Modo Turbo."
+        )
+    if status_code >= 500:
+        return (
+            "**API temporariamente indisponivel.**\n\n"
+            "Tente novamente em alguns minutos. A analise local do AutoAnalista continua funcionando."
+        )
+    return f"**Falha ao acionar o Modo Turbo.**\n\nStatus da API: `{status_code}`.\n\nDetalhe: {clean_report_text(message, 420)}"
+
+
 def call_turbo_ai(
     turbo_config: Optional[dict],
     *,
@@ -780,8 +822,8 @@ def call_turbo_ai(
         text = result.get("choices", [{}])[0].get("message", {}).get("content", "")
         return True, text.strip() or "A API respondeu sem texto utilizavel."
     except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="ignore")[:500]
-        return False, f"Falha na API ({exc.code}). {detail}"
+        detail = exc.read().decode("utf-8", errors="ignore")[:2000]
+        return False, friendly_turbo_api_error(exc.code, detail)
     except Exception as exc:
         return False, f"Nao foi possivel acionar o Modo Turbo: {str(exc)[:500]}"
 
@@ -882,7 +924,8 @@ def render_turbo_ai_box(
             st.success("Analise Turbo gerada.")
             st.markdown(result.get("text", ""))
         else:
-            st.error(result.get("text", "Falha ao gerar analise Turbo."))
+            st.warning(result.get("text", "Falha ao gerar analise Turbo."))
+            st.caption("O AutoAnalista continua operando normalmente com as analises locais, dashboards, insights e ML sem API.")
 
 
 def render_database_controls(role: str) -> None:
